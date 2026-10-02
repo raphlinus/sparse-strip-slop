@@ -16,7 +16,7 @@ struct Entry {
 
 @group(0) @binding(0) var<storage, read> lines: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> entries: array<Entry>;
-@group(0) @binding(2) var<storage, read_write> alpha_out: array<atomic<u32>>;
+@group(0) @binding(2) var<storage, read_write> alpha_out: array<u32>;
 @group(0) @binding(3) var<storage, read_write> partials_out: array<i32>;
 @group(0) @binding(4) var<storage, read> path_flags: array<u32>;
 
@@ -253,8 +253,10 @@ fn resolve(w: i32, even_odd: bool) -> u32 {
 
 // Store the result for the run/piece headed at entry `e`: resolved alpha, or an
 // unresolved partial if the output index carries OUT_PARTIAL. `vals` is for chunk
-// `ch` of coset `c`.
-fn store_result(e: Entry, even_odd: bool, vals: array<i32, CHUNK>, c: u32, ch: u32) {
+// `ch` of coset `c`. For chunks smaller than a word, resolved bytes accumulate in
+// `pack` (one register per output stream) and the word is stored when complete; the
+// same thread stores every chunk of a stream, so no atomics are needed.
+fn store_result(e: Entry, even_odd: bool, vals: array<i32, CHUNK>, c: u32, ch: u32, pack: ptr<function, u32>) {
     let bd = e.backdrop * 65536;
     if (e.out & OUT_PARTIAL) != 0u {
         let base = (e.out & ~OUT_PARTIAL) * 64u + c * 16u + ch * CHUNK;
@@ -264,13 +266,14 @@ fn store_result(e: Entry, even_odd: bool, vals: array<i32, CHUNK>, c: u32, ch: u
     } else {
         let base = e.out * 16u + c * 4u + (ch * CHUNK) / 4u;
         if CHUNK < 4u {
-            // Partial word: OR the bytes into the (zero-initialized) output.
             let shift = 8u * ((ch * CHUNK) & 3u);
-            var packed = 0u;
             for (var i = 0u; i < CHUNK; i++) {
-                packed |= resolve(vals[i] + bd, even_odd) << (shift + 8u * i);
+                *pack |= resolve(vals[i] + bd, even_odd) << (shift + 8u * i);
             }
-            atomicOr(&alpha_out[base], packed);
+            if ((ch * CHUNK + CHUNK) & 3u) == 0u {
+                alpha_out[base] = *pack;
+                *pack = 0u;
+            }
             return;
         }
         for (var g = 0u; g < CHUNK / 4u; g++) {
@@ -278,7 +281,7 @@ fn store_result(e: Entry, even_odd: bool, vals: array<i32, CHUNK>, c: u32, ch: u
             for (var i = 0u; i < 4u; i++) {
                 packed |= resolve(vals[g * 4u + i] + bd, even_odd) << (8u * i);
             }
-            atomicStore(&alpha_out[base + g], packed);
+            alpha_out[base + g] = packed;
         }
     }
 }

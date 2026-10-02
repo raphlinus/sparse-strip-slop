@@ -32,6 +32,7 @@ fn main(
 
     let ls = line_setup(e);
     let eo = path_even_odd(e);
+    var pack = 0u;
     for (var c = 0u; c < 4u; c++) {
         var cs = coset_setup(ls, c);
         for (var ch = 0u; ch < N_CHUNKS; ch++) {
@@ -52,7 +53,7 @@ fn main(
                 for (var i = 0u; i < CHUNK; i++) {
                     m[i] = atomicLoad(&sh_slot[head_slot + i]);
                 }
-                store_result(e, eo, m, c, ch);
+                store_result(e, eo, m, c, ch, &pack);
             }
         }
     }

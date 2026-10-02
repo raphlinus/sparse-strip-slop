@@ -18,6 +18,7 @@ fn main(
     let e = entries[i0];
     let is_head = t == 0u || entries[i0 - 1u].key != e.key;
     var acc = 0;
+    var pack = 0u;
     if PROFILE == 0u {
         let l = lines[e.line & ~LINE_LEFT_EDGE];
         acc = bitcast<i32>(bitcast<u32>(l.x) ^ bitcast<u32>(l.y) ^ bitcast<u32>(l.z) ^ bitcast<u32>(l.w));
@@ -42,7 +43,7 @@ fn main(
                 for (var ch = 0u; ch < N_CHUNKS; ch++) {
                     let m = compute_chunk(ls, &cs, c, ch);
                     if PROFILE >= 5u && is_head {
-                        store_result(e, eo, m, c, ch);
+                        store_result(e, eo, m, c, ch, &pack);
                     } else {
                         for (var i = 0u; i < CHUNK; i++) {
                             acc ^= m[i];

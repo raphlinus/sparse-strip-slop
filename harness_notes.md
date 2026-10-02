@@ -101,7 +101,7 @@ chunk 4, 16 at chunk 8). Chunk 4 is one coset row, so row constants are computed
 per chunk. Chunk 8 has been consistently slower, so barriers are not the bottleneck
 here; register pressure from the larger arrays is the likelier cost.
 
-## Chunk 1 and 2 (CHUNK below 4 supported via atomicOr sub-word alpha stores)
+## Chunk 1 and 2 (CHUNK below 4 supported)
 
 Full merge, 480K entries, wg256, median ms:
 
@@ -119,6 +119,21 @@ through a dynamically indexed loop (stack). Barriers and workgroup atomics are c
 this GPU: the entire slot/atomic/barrier overhead at chunk 1 is 0.07 ms, 14% of the total.
 Conclusion so far: on Apple silicon the design should minimize per-thread array state;
 per-pixel processing with scalar registers beats batching pixels per barrier.
+
+## Packed register stores instead of atomicOr
+
+Sub-word chunks first used `atomicOr` into a zeroed alpha buffer. Since the same thread
+stores every chunk of an output stream (case bits are fixed per thread), the resolved
+bytes now accumulate in a register per stream (`pack`, or `pack_imm` / `pack_final` in
+the two-line variant) and one plain store happens per word. No zero-initialization of
+the output is needed. Chunk 1, 480K entries, median ms:
+
+| variant   | atomicOr | packed register |
+|-----------|----------|-----------------|
+| one line  | 0.503    | 0.481           |
+| two lines | 0.492    | 0.455           |
+
+First configuration where two lines per thread beats one line (by 6%).
 
 ## Ideas not yet tried
 
