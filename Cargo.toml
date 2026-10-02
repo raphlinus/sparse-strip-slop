@@ -1,0 +1,17 @@
+[package]
+name = "sparse_strip"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+vello_common = { path = "/Users/raphl/gh/vello/vello_common", features = ["pico_svg"] }
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.18"
+wgpu = "30"
+pollster = "0.4"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+debug = true
