@@ -52,8 +52,8 @@ The "at most 4 partial cells per coset" bound held on all 119K (entry, coset) pa
 | variant                | median ms |
 |------------------------|-----------|
 | compute only (floor)   | 0.632     |
-| one line, wg256, ch4   | 0.831     |
-| two lines, wg256, ch4  | 0.855     |
+| one line, wg256, ch4   | 0.831 (0.660 after phase-2 fixes) |
+| two lines, wg256, ch4  | 0.855 (0.665 after phase-2 fixes) |
 | one line, wg256, ch8   | 0.910     |
 | two lines, wg256, ch8  | 0.958     |
 | one line, wg128, ch4   | 0.825     |
@@ -66,6 +66,40 @@ Observations:
   two-line variant was 30% slower from warp divergence on `ix`.
 - Chunk 8 is slower than chunk 4 in both variants.
 - Workgroup size 128 vs 256 makes no difference.
+
+## Phase 2 profile by ablation (same workload, `PROFILE=1` env var)
+
+`merge0.wgsl` runs phase 2 only, with a compile-time `PROFILE` level enabling one stage at
+a time and folding results into a register so nothing is eliminated. Timings were checked
+for clock drift (early vs late quarter medians identical, 200 vs 1000 iterations
+identical, untimed warm-up burst before the timed passes).
+
+| stage (cumulative)                   | before | after  |
+|--------------------------------------|--------|--------|
+| read entry + line, line_setup        | 0.01   | 0.01   |
+| + coset classification (64 cells)    | 0.13   | 0.13   |
+| + FIFO fill (cell_area for hits)     | 0.17   | 0.17   |
+| + compute_chunk consumption          | 0.45   | 0.31   |
+| + store_result for heads             | 0.63   | 0.47   |
+| full one-line merge                  | 0.83   | 0.66   |
+
+"After" = compute_chunk hand-unrolled per coset row (cells written explicitly instead of
+a dynamically indexed loop), even-odd resolve using a mask instead of `%`, and the path
+flag loaded once per entry instead of per store. Consumption had cost 2.3x the
+classification it consumes, which points at the returned `array<i32, CHUNK>` and nested
+loops landing in stack memory; the remaining 0.14 ms there is still the largest phase-2
+item and is mostly `row_consts` (two round-and-convert per row) and the FIFO shuffles.
+Scheduling (slots, atomics, barriers) is 0.19 ms on top of phase 2 in both variants.
+
+## What CHUNK controls
+
+CHUNK is the number of coset-walk positions (pixels) each thread processes per barrier
+pair. It sets the slot size per thread in workgroup memory (`WG_SIZE * CHUNK` i32), the
+size of the `m0`, `m1`, `s` register arrays, the output store granularity (`CHUNK / 4`
+u32 of packed alpha), and the barrier count: `2 * 4 * 16 / CHUNK` per thread (32 at
+chunk 4, 16 at chunk 8). Chunk 4 is one coset row, so row constants are computed once
+per chunk. Chunk 8 has been consistently slower, so barriers are not the bottleneck
+here; register pressure from the larger arrays is the likelier cost.
 
 ## Ideas not yet tried
 

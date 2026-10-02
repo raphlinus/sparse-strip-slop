@@ -15,6 +15,8 @@ pub enum Mode {
 #[derive(Clone, Copy, Debug)]
 pub struct Variant {
     pub mode: Mode,
+    /// Profile level for `Mode::ComputeOnly` (see shader/merge0.wgsl); ignored otherwise.
+    pub profile: u32,
     pub wg_size: u32,
     pub chunk: u32,
 }
@@ -30,13 +32,17 @@ impl Variant {
             Mode::OneLine => "oneline",
             Mode::TwoLines => "twoline",
         };
-        format!("{mode}_wg{}_chunk{}", self.wg_size, self.chunk)
+        if self.mode == Mode::ComputeOnly {
+            format!("{mode}{}_wg{}_chunk{}", self.profile, self.wg_size, self.chunk)
+        } else {
+            format!("{mode}_wg{}_chunk{}", self.wg_size, self.chunk)
+        }
     }
 
     pub fn shader_source(&self) -> String {
         let header = format!(
-            "const WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\n",
-            self.wg_size, self.chunk
+            "const WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\n",
+            self.wg_size, self.chunk, self.profile
         );
         let body = match self.mode {
             Mode::ComputeOnly => include_str!("../shader/merge0.wgsl"),
@@ -204,6 +210,16 @@ impl Gpu {
         };
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Untimed warm-up so the GPU clock has ramped before the timed passes.
+        for _ in 0..iterations.max(50) {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(n_wg, 1, 1);
+        }
         for it in 0..iterations {
             let timestamp_writes = query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
                 query_set: qs,

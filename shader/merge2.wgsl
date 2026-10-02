@@ -67,6 +67,8 @@ fn main(
     let final_at0 = b == 4u || b == 5u || b == 7u;
     let e_imm = select_entry(e1, e0, ix == 0u);
     let e_final = select_entry(e1, e0, final_at0);
+    let eo_imm = path_even_odd(e_imm);
+    let eo_final = path_even_odd(e_final);
 
     for (var c = 0u; c < 4u; c++) {
         var cs0 = coset_setup(ls0, c);
@@ -83,7 +85,7 @@ fn main(
                 m1[i] = select(ma[i], mb[i], ix == 0u);
             }
             if imm_store {
-                store_result(e_imm, m0, c, ch);
+                store_result(e_imm, eo_imm, m0, c, ch);
             }
             var s: array<i32, CHUNK>;
             for (var i = 0u; i < CHUNK; i++) {
@@ -108,7 +110,7 @@ fn main(
                         s[i] = atomicLoad(&sh_slot[own_slot + i]);
                     }
                 }
-                store_result(e_final, s, c, ch);
+                store_result(e_final, eo_final, s, c, ch);
             }
         }
     }

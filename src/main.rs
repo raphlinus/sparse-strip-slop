@@ -219,15 +219,22 @@ fn main() {
         println!("note: adapter lacks timestamp queries; no GPU timings");
     }
 
-    let variants = [
-        Variant { mode: Mode::ComputeOnly, wg_size: 256, chunk: 4 },
-        Variant { mode: Mode::OneLine, wg_size: 256, chunk: 4 },
-        Variant { mode: Mode::TwoLines, wg_size: 256, chunk: 4 },
-        Variant { mode: Mode::OneLine, wg_size: 256, chunk: 8 },
-        Variant { mode: Mode::TwoLines, wg_size: 256, chunk: 8 },
-        Variant { mode: Mode::OneLine, wg_size: 128, chunk: 4 },
-        Variant { mode: Mode::TwoLines, wg_size: 128, chunk: 4 },
-    ];
+    let profile_only = std::env::var("PROFILE").is_ok();
+    let variants: Vec<Variant> = if profile_only {
+        (0..=5)
+            .map(|profile| Variant { mode: Mode::ComputeOnly, profile, wg_size: 256, chunk: 4 })
+            .collect()
+    } else {
+        vec![
+            Variant { mode: Mode::ComputeOnly, profile: 5, wg_size: 256, chunk: 4 },
+            Variant { mode: Mode::OneLine, profile: 0, wg_size: 256, chunk: 4 },
+            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 256, chunk: 4 },
+            Variant { mode: Mode::OneLine, profile: 0, wg_size: 256, chunk: 8 },
+            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 256, chunk: 8 },
+            Variant { mode: Mode::OneLine, profile: 0, wg_size: 128, chunk: 4 },
+            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 128, chunk: 4 },
+        ]
+    };
 
     let mut truth_written = false;
     for (vi, variant) in variants.iter().enumerate() {
@@ -258,21 +265,34 @@ fn main() {
         );
         if !result.times_ms.is_empty() {
             // Skip warm-up iterations; the first timestamp pair is also unreliable on Metal.
-            let skip = (result.times_ms.len() / 4).max(1);
+            let skip = 1;
             let n_zero = result.times_ms[skip..].iter().filter(|&&t| t == 0.0).count();
-            let mut t: Vec<f64> = result.times_ms[skip..].iter().copied().filter(|&t| t > 0.0).collect();
+            let all: Vec<f64> = result.times_ms[skip..].iter().copied().filter(|&t| t > 0.0).collect();
+            let median = |v: &[f64]| {
+                let mut v = v.to_vec();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let q = all.len() / 4;
+            println!(
+                "  clock drift check: early-quarter median {:.3} ms, late-quarter median {:.3} ms",
+                median(&all[..q.max(1)]),
+                median(&all[all.len() - q.max(1)..])
+            );
+            let mut t = all;
             if n_zero > 0 {
                 println!("  ({} zero-length timestamp pairs dropped)", n_zero);
             }
             t.sort_by(|a, b| a.partial_cmp(b).unwrap());
             println!(
-                "  gpu: {} entries, {} workgroups, min {:.3} ms, median {:.3} ms, max {:.3} ms over {} iterations",
+                "  gpu: {} entries, {} workgroups, min {:.3} ms, median {:.3} ms, max {:.3} ms over {} iterations ({:.2} ns/entry)",
                 tiled.entries.len(),
                 tiled.entries.len() / variant.entries_per_wg(),
                 t[0],
                 t[t.len() / 2],
                 t[t.len() - 1],
-                t.len()
+                t.len(),
+                t[t.len() / 2] * 1e6 / tiled.entries.len() as f64
             );
         }
 

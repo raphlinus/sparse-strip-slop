@@ -35,6 +35,10 @@ struct LineSetup {
     ye_sign: f32,
 }
 
+fn path_even_odd(e: Entry) -> bool {
+    return (path_flags[e.key >> 20u] & 1u) != 0u;
+}
+
 fn line_setup(e: Entry) -> LineSetup {
     let l = lines[e.line & ~LINE_LEFT_EDGE];
     let tx = e.key & 0x3ffu;
@@ -143,7 +147,8 @@ struct CosetState {
     f3: i32,
 }
 
-fn coset_setup(ls: LineSetup, c: u32) -> CosetState {
+// Classification only: hit and side masks for the 16 cells of coset c.
+fn coset_classify(ls: LineSetup, c: u32) -> CosetState {
     var cs: CosetState;
     var hits = 0u;
     var sides = 0u;
@@ -161,8 +166,16 @@ fn coset_setup(ls: LineSetup, c: u32) -> CosetState {
     }
     cs.hits = hits;
     cs.sides = sides;
-    // Fixed-trip fill of the FIFO.
-    var m = hits;
+    cs.f0 = 0;
+    cs.f1 = 0;
+    cs.f2 = 0;
+    cs.f3 = 0;
+    return cs;
+}
+
+// Fixed-trip fill of the FIFO with the areas of the (at most 4) hit cells, in walk order.
+fn coset_fill(ls: LineSetup, c: u32, cs: ptr<function, CosetState>) {
+    var m = (*cs).hits;
     var vals = array<i32, 4>(0, 0, 0, 0);
     for (var i = 0u; i < 4u; i++) {
         let pos = firstTrailingBit(m);
@@ -173,55 +186,66 @@ fn coset_setup(ls: LineSetup, c: u32) -> CosetState {
         vals[i] = v;
         m &= m - 1u;
     }
-    cs.f0 = vals[0];
-    cs.f1 = vals[1];
-    cs.f2 = vals[2];
-    cs.f3 = vals[3];
+    (*cs).f0 = vals[0];
+    (*cs).f1 = vals[1];
+    (*cs).f2 = vals[2];
+    (*cs).f3 = vals[3];
+}
+
+fn coset_setup(ls: LineSetup, c: u32) -> CosetState {
+    var cs = coset_classify(ls, c);
+    coset_fill(ls, c, &cs);
     return cs;
 }
 
-// Produce the CHUNK values for chunk `ch` of coset `c`, consuming the FIFO.
+// Pop the FIFO front.
+fn fifo_pop(cs: ptr<function, CosetState>) -> i32 {
+    let v = (*cs).f0;
+    (*cs).f0 = (*cs).f1;
+    (*cs).f1 = (*cs).f2;
+    (*cs).f2 = (*cs).f3;
+    return v;
+}
+
+// One cell of the walk: FIFO value if partial, else the side shortcut, plus y_edge.
+fn cell_value(cs: ptr<function, CosetState>, pos: u32, rc: RowConsts) -> i32 {
+    var v: i32;
+    if (((*cs).hits >> pos) & 1u) != 0u {
+        v = fifo_pop(cs);
+    } else {
+        v = select(0, rc.dy_fixed, (((*cs).sides >> pos) & 1u) != 0u);
+    }
+    return v + rc.ye_fixed;
+}
+
+// Produce the CHUNK values for chunk `ch` of coset `c`, consuming the FIFO. A chunk is
+// CHUNK / 4 coset rows; cells within a row are written out explicitly.
 fn compute_chunk(ls: LineSetup, cs: ptr<function, CosetState>, c: u32, ch: u32) -> array<i32, CHUNK> {
     var out: array<i32, CHUNK>;
-    var rc: RowConsts;
-    for (var i = 0u; i < CHUNK; i++) {
-        let pos = ch * CHUNK + i;
-        if (pos & 3u) == 0u {
-            // Row constants are shared by the 4 cells of a coset row.
-            rc = row_consts(ls, coset_y(c, pos));
-        }
-        var v: i32;
-        if (((*cs).hits >> pos) & 1u) != 0u {
-            v = (*cs).f0;
-            (*cs).f0 = (*cs).f1;
-            (*cs).f1 = (*cs).f2;
-            (*cs).f2 = (*cs).f3;
-        } else {
-            v = select(0, rc.dy_fixed, (((*cs).sides >> pos) & 1u) != 0u);
-        }
-        out[i] = v + rc.ye_fixed;
+    for (var r = 0u; r < CHUNK / 4u; r++) {
+        let pos = ch * CHUNK + r * 4u;
+        let rc = row_consts(ls, coset_y(c, pos));
+        out[r * 4u] = cell_value(cs, pos, rc);
+        out[r * 4u + 1u] = cell_value(cs, pos + 1u, rc);
+        out[r * 4u + 2u] = cell_value(cs, pos + 2u, rc);
+        out[r * 4u + 3u] = cell_value(cs, pos + 3u, rc);
     }
     return out;
 }
 
 fn resolve(w: i32, even_odd: bool) -> u32 {
-    var cv: i32;
-    if even_odd {
-        var m = w % 131072;
-        if m < 0 {
-            m += 131072;
-        }
-        cv = select(m, 131072 - m, m > 65536);
-    } else {
-        cv = min(abs(w), 65536);
-    }
+    // Even-odd: triangle wave with period 2 (131072 is a power of two, so the mask is the
+    // positive modulus). Nonzero: clamp |w|.
+    let m = w & 131071;
+    let eo = select(m, 131072 - m, m > 65536);
+    let cv = select(min(abs(w), 65536), eo, even_odd);
     return u32((cv * 255 + 32768) >> 16u);
 }
 
 // Store the result for the run/piece headed at entry `e`: resolved alpha, or an
 // unresolved partial if the output index carries OUT_PARTIAL. `vals` is for chunk
 // `ch` of coset `c`.
-fn store_result(e: Entry, vals: array<i32, CHUNK>, c: u32, ch: u32) {
+fn store_result(e: Entry, even_odd: bool, vals: array<i32, CHUNK>, c: u32, ch: u32) {
     let bd = e.backdrop * 65536;
     if (e.out & OUT_PARTIAL) != 0u {
         let base = (e.out & ~OUT_PARTIAL) * 64u + c * 16u + ch * CHUNK;
@@ -229,7 +253,6 @@ fn store_result(e: Entry, vals: array<i32, CHUNK>, c: u32, ch: u32) {
             partials_out[base + i] = vals[i] + bd;
         }
     } else {
-        let even_odd = (path_flags[e.key >> 20u] & 1u) != 0u;
         let base = e.out * 16u + c * 4u + (ch * CHUNK) / 4u;
         for (var g = 0u; g < CHUNK / 4u; g++) {
             var packed = 0u;
