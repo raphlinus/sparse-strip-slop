@@ -154,6 +154,26 @@ Mean run length at 4x4 is 1.5, at 8x8 1.9.
 Natural (unreplicated) 1600x1600 tiger merge: 0.069 ms at 8x8 (latency bound, ~200
 workgroups), 1.33 ns/entry vs 0.91 saturated.
 
+## Phase 2 profile at 4x4 vs 8x8 (same scene, 16x replicated, chunk 1, stage deltas in ms)
+
+| stage                         | 4x4 (1.37M entries) | 8x8 (823K entries) |
+|-------------------------------|---------------------|--------------------|
+| read entry + line, setup      | 0.024               | 0.017              |
+| coset classification          | 0.117               | 0.198              |
+| FIFO fill (cell_area on hits) | 0.079               | 0.074              |
+| compute_chunk consumption     | 0.104               | 0.236              |
+| store_result (heads)          | 0.090               | 0.207              |
+| phase 2 total                 | 0.414               | 0.732              |
+| full two-line merge           | 0.432               | 0.757              |
+
+The FIFO fill is the only stage doing geometry-proportional work (area of cells the line
+actually crosses), and it costs the same at both tile sizes, since the set of crossed
+pixels does not depend on tiling. Everything else scales with pixels per entry
+(classification, consumption, resolve) or with entry count (setup, store), i.e. it is
+dense overhead: 82% of phase 2 at 4x4 and 90% at 8x8. The slot/atomic/barrier
+scheduling is 0.02 ms in both. At chunk 2 (4x4) consumption and store are each ~0.1 ms
+worse, the same array-codegen effect seen at 8x8.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and
