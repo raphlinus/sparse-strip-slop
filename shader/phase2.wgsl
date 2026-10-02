@@ -196,9 +196,46 @@ fn coset_fill(ls: LineSetup, c: u32, cs: ptr<function, CosetState>) {
 }
 
 fn coset_setup(ls: LineSetup, c: u32) -> CosetState {
+    if DENSE != 0u {
+        return CosetState(0u, 0u, 0, 0, 0, 0);
+    }
     var cs = coset_classify(ls, c);
     coset_fill(ls, c, &cs);
     return cs;
+}
+
+// Dense evaluation: the segment's x-interval in row y (relative to x = 0) and dy.
+struct RowSpan {
+    xmin: f32,
+    xmax: f32,
+    dy: f32,
+    ye_fixed: i32,
+}
+
+fn row_span(ls: LineSetup, y: u32) -> RowSpan {
+    var rs: RowSpan;
+    let yrel = ls.q0.y - f32(y);
+    let y0c = clamp(yrel, 0.0, 1.0);
+    let y1c = clamp(yrel + (ls.q1.y - ls.q0.y), 0.0, 1.0);
+    rs.dy = y0c - y1c;
+    let t0 = (y0c - yrel) * ls.recip;
+    let t1 = (y1c - yrel) * ls.recip;
+    let dxc = ls.q1.x - ls.q0.x;
+    let x0 = ls.q0.x + t0 * dxc;
+    let x1 = ls.q0.x + t1 * dxc;
+    rs.xmin = min(x0, x1);
+    rs.xmax = max(x0, x1);
+    rs.ye_fixed = i32(round(ls.ye_sign * clamp(f32(y) - ls.ye + 1.0, 0.0, 1.0) * FIXED_ONE));
+    return rs;
+}
+
+fn dense_cell(rs: RowSpan, x: u32) -> i32 {
+    var v = 0;
+    if rs.dy != 0.0 {
+        let xf = f32(x);
+        v = i32(round(area_weight(rs.xmin - xf, rs.xmax - xf) * rs.dy * FIXED_ONE));
+    }
+    return v + rs.ye_fixed;
 }
 
 // Pop the FIFO front.
@@ -225,6 +262,17 @@ fn cell_value(cs: ptr<function, CosetState>, pos: u32, rc: RowConsts) -> i32 {
 // CHUNK / 4 coset rows; cells within a row are written out explicitly.
 fn compute_chunk(ls: LineSetup, cs: ptr<function, CosetState>, c: u32, ch: u32) -> array<i32, CHUNK> {
     var out: array<i32, CHUNK>;
+    if DENSE != 0u {
+        // Every cell through the full area formula; row span once per coset row.
+        for (var r = 0u; r < max(CHUNK / HALF, 1u); r++) {
+            let pos = ch * CHUNK + r * HALF;
+            let rs = row_span(ls, coset_y(c, pos));
+            for (var i = 0u; i < min(CHUNK, HALF); i++) {
+                out[r * HALF + i] = dense_cell(rs, coset_x(c, pos + i));
+            }
+        }
+        return out;
+    }
     if CHUNK < 4u {
         // Sub-row chunk: all cells share one row.
         let pos = ch * CHUNK;

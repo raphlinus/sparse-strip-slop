@@ -174,6 +174,30 @@ dense overhead: 82% of phase 2 at 4x4 and 90% at 8x8. The slot/atomic/barrier
 scheduling is 0.02 ms in both. At chunk 2 (4x4) consumption and store are each ~0.1 ms
 worse, the same array-codegen effect seen at 8x8.
 
+## Dense vs sparse (coset) phase 2
+
+`DENSE` (header const, `dense` on Variant, `DENSE=1` env for the profile run) evaluates
+every cell with the full area formula, row span computed once per coset row, no
+classification and no FIFO. Walk order and output layout are unchanged. Same scene
+(1600x1600 tiger), 16x replicated, median ms:
+
+| tile | variant            | sparse | dense | speedup |
+|------|--------------------|--------|-------|---------|
+| 8x8  | phase 2 only, ch1  | 0.732  | 0.434 | 1.69x   |
+| 8x8  | one line, ch1      | 0.800  | 0.522 | 1.53x   |
+| 8x8  | two lines, ch1     | 0.753  | 0.460 | 1.64x   |
+| 8x8  | two lines, ch4     | 1.093  | 0.934 | 1.17x   |
+| 4x4  | phase 2 only, ch1  | 0.414  | 0.211 | 1.96x   |
+| 4x4  | one line, ch1      | 0.481  | 0.289 | 1.66x   |
+| 4x4  | two lines, ch1     | 0.431  | 0.231 | 1.87x   |
+
+Dense wins everywhere. The coset scheme saves at most 12 of 16 area evaluations per
+coset but pays 16 FMA-and-compare classifications plus mask and FIFO bookkeeping, and
+area_weight is only about a dozen operations including one division. Best configuration
+so far: dense, 4x4, two lines per thread, chunk 1, at 0.231 ms for 1.37M entries
+(0.17 ns/entry), 3.3x faster than the original sparse 8x8 chunk 4 two-line (0.757 ms,
+or 1.09 ms before the codegen fixes). Output still within 1 LSB of the oracle.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and

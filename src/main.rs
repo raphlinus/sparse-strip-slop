@@ -221,27 +221,30 @@ fn main() {
 
     let profile_only = std::env::var("PROFILE").is_ok();
     let profile_chunk: u32 = std::env::var("CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-    println!("tile size {TILE}");
+    let profile_dense = std::env::var("DENSE").is_ok();
+    let v = |mode: Mode, chunk: u32, dense: bool| Variant { mode, profile: 5, dense, wg_size: 256, chunk };
     let variants: Vec<Variant> = if profile_only {
         (0..=5)
-            .map(|profile| Variant { mode: Mode::ComputeOnly, profile, wg_size: 256, chunk: profile_chunk })
+            .map(|profile| Variant { mode: Mode::ComputeOnly, profile, dense: profile_dense, wg_size: 256, chunk: profile_chunk })
             .collect()
     } else {
         vec![
-            Variant { mode: Mode::ComputeOnly, profile: 5, wg_size: 256, chunk: 4 },
-            Variant { mode: Mode::OneLine, profile: 0, wg_size: 256, chunk: 4 },
-            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 256, chunk: 4 },
-            Variant { mode: Mode::OneLine, profile: 0, wg_size: 256, chunk: 8 },
-            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 256, chunk: 8 },
-            Variant { mode: Mode::OneLine, profile: 0, wg_size: 128, chunk: 4 },
-            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 128, chunk: 4 },
-            Variant { mode: Mode::OneLine, profile: 0, wg_size: 256, chunk: 2 },
-            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 256, chunk: 2 },
-            Variant { mode: Mode::OneLine, profile: 0, wg_size: 256, chunk: 1 },
-            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 256, chunk: 1 },
+            v(Mode::ComputeOnly, 1, false),
+            v(Mode::ComputeOnly, 1, true),
+            v(Mode::OneLine, 1, false),
+            v(Mode::TwoLines, 1, false),
+            v(Mode::OneLine, 1, true),
+            v(Mode::TwoLines, 1, true),
+            v(Mode::OneLine, 2, false),
+            v(Mode::TwoLines, 2, false),
+            v(Mode::OneLine, 2, true),
+            v(Mode::TwoLines, 2, true),
+            v(Mode::OneLine, 4, false),
+            v(Mode::TwoLines, 4, false),
+            v(Mode::OneLine, 4, true),
+            v(Mode::TwoLines, 4, true),
         ]
     };
-
     // A chunk must be a sub-row (<= TILE/2 cells) or whole rows (multiple of 4 at TILE 8).
     let variants: Vec<Variant> = variants
         .into_iter()

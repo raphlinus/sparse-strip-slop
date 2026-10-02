@@ -17,6 +17,8 @@ pub struct Variant {
     pub mode: Mode,
     /// Profile level for `Mode::ComputeOnly` (see shader/merge0.wgsl); ignored otherwise.
     pub profile: u32,
+    /// Evaluate every cell with the full area formula (no coset classification / FIFO).
+    pub dense: bool,
     pub wg_size: u32,
     pub chunk: u32,
 }
@@ -32,17 +34,18 @@ impl Variant {
             Mode::OneLine => "oneline",
             Mode::TwoLines => "twoline",
         };
+        let dense = if self.dense { "_dense" } else { "" };
         if self.mode == Mode::ComputeOnly {
-            format!("{mode}{}_wg{}_chunk{}", self.profile, self.wg_size, self.chunk)
+            format!("{mode}{}_wg{}_chunk{}{dense}", self.profile, self.wg_size, self.chunk)
         } else {
-            format!("{mode}_wg{}_chunk{}", self.wg_size, self.chunk)
+            format!("{mode}_wg{}_chunk{}{dense}", self.wg_size, self.chunk)
         }
     }
 
     pub fn shader_source(&self) -> String {
         let header = format!(
-            "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\n",
-            TILE, self.wg_size, self.chunk, self.profile
+            "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\nconst DENSE: u32 = {}u;\n",
+            TILE, self.wg_size, self.chunk, self.profile, self.dense as u32
         );
         let body = match self.mode {
             Mode::ComputeOnly => include_str!("../shader/merge0.wgsl"),
