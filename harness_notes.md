@@ -198,6 +198,28 @@ so far: dense, 4x4, two lines per thread, chunk 1, at 0.231 ms for 1.37M entries
 (0.17 ns/entry), 3.3x faster than the original sparse 8x8 chunk 4 two-line (0.757 ms,
 or 1.09 ms before the codegen fixes). Output still within 1 LSB of the oracle.
 
+## Row skipping in the dense path (tried and removed)
+
+Branching around rows with `dy == 0` gave no gain (8x8 two-line ch1: 0.458 -> 0.464 ms;
+ch4: 0.943 -> 1.059) although 64% of entry rows at 8x8 and 51% at 4x4 are empty. Rows
+empty across an entire 32-lane SIMD group of consecutive entries are only 0.7% and
+0.4%, so the group executes the covered path anyway. Per-lane sparseness inside the
+lockstep walk is bounded by that group statistic unless lanes are grouped by coverage.
+
+## Stripped-down shader (`shader/merge_simple.wgsl`, `Mode::Simple`)
+
+Self-contained, one entry per thread, sparse cosets, one pixel per barrier pair, scalar
+locals only, no includes or switches. Written to rule out compiler bad luck in the
+modular version and to be read. Same scene, 16x replicated, median ms:
+
+| tile | simple | modular one line ch1 sparse | one line ch1 dense |
+|------|--------|-----------------------------|--------------------|
+| 8x8  | 0.824  | 0.809                       | 0.521              |
+| 4x4  | 0.481  | 0.485                       | 0.289              |
+
+Identical within noise: the sparse scheme's cost is in its structure, not in how the
+modular code compiled.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and

@@ -229,20 +229,11 @@ fn main() {
             .collect()
     } else {
         vec![
-            v(Mode::ComputeOnly, 1, false),
-            v(Mode::ComputeOnly, 1, true),
+            v(Mode::Simple, 1, false),
             v(Mode::OneLine, 1, false),
-            v(Mode::TwoLines, 1, false),
             v(Mode::OneLine, 1, true),
+            v(Mode::TwoLines, 1, false),
             v(Mode::TwoLines, 1, true),
-            v(Mode::OneLine, 2, false),
-            v(Mode::TwoLines, 2, false),
-            v(Mode::OneLine, 2, true),
-            v(Mode::TwoLines, 2, true),
-            v(Mode::OneLine, 4, false),
-            v(Mode::TwoLines, 4, false),
-            v(Mode::OneLine, 4, true),
-            v(Mode::TwoLines, 4, true),
         ]
     };
     // A chunk must be a sub-row (<= TILE/2 cells) or whole rows (multiple of 4 at TILE 8).

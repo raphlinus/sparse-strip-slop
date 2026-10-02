@@ -10,6 +10,8 @@ pub enum Mode {
     ComputeOnly,
     OneLine,
     TwoLines,
+    /// Self-contained stripped-down shader (one line per thread, sparse, chunk 1).
+    Simple,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -33,8 +35,12 @@ impl Variant {
             Mode::ComputeOnly => "computeonly",
             Mode::OneLine => "oneline",
             Mode::TwoLines => "twoline",
+            Mode::Simple => "simple",
         };
         let dense = if self.dense { "_dense" } else { "" };
+        if self.mode == Mode::Simple {
+            return format!("simple_wg{}", self.wg_size);
+        }
         if self.mode == Mode::ComputeOnly {
             format!("{mode}{}_wg{}_chunk{}{dense}", self.profile, self.wg_size, self.chunk)
         } else {
@@ -47,10 +53,19 @@ impl Variant {
             "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\nconst DENSE: u32 = {}u;\n",
             TILE, self.wg_size, self.chunk, self.profile, self.dense as u32
         );
+        if self.mode == Mode::Simple {
+            return format!(
+                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\n{}",
+                TILE,
+                self.wg_size,
+                include_str!("../shader/merge_simple.wgsl")
+            );
+        }
         let body = match self.mode {
             Mode::ComputeOnly => include_str!("../shader/merge0.wgsl"),
             Mode::OneLine => include_str!("../shader/merge1.wgsl"),
             Mode::TwoLines => include_str!("../shader/merge2.wgsl"),
+            Mode::Simple => unreachable!(),
         };
         format!("{header}{}\n{body}", include_str!("../shader/phase2.wgsl"))
     }
