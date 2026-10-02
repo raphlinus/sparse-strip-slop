@@ -6,7 +6,7 @@
 //!   specified to perform (x-clipped segment, fill_path area, y_edge term, fixed point).
 
 use crate::scene::Scene;
-use crate::tiler::{Entry, LINE_LEFT_EDGE, Run, TILE, Tiled};
+use crate::tiler::{Entry, LINE_LEFT_EDGE, PIXELS, Run, TILE, Tiled};
 
 pub const FIXED_SHIFT: u32 = 16;
 pub const FIXED_ONE: i32 = 1 << FIXED_SHIFT;
@@ -208,11 +208,11 @@ pub fn classify_cell(ls: &LineSetup, x: u32, y: u32) -> (bool, bool) {
     (s.abs() < ls.h, (s > 0.0) == (ls.a > 0.0))
 }
 
-/// Contribution of one (line, tile) entry: 64 fixed-point values, row-major (y * 8 + x),
+/// Contribution of one (line, tile) entry: PIXELS fixed-point values, row-major (y * 8 + x),
 /// computed exactly the way the shader does (classification, side shortcut, y_edge).
-pub fn entry_contrib(line: &[f32; 4], tx: u32, ty: u32, left_edge: bool) -> [i32; 64] {
+pub fn entry_contrib(line: &[f32; 4], tx: u32, ty: u32, left_edge: bool) -> [i32; PIXELS] {
     let ls = line_setup(line, tx, ty, left_edge);
-    let mut out = [0i32; 64];
+    let mut out = [0i32; PIXELS];
     for y in 0..TILE {
         let dy_fixed = fixed(row_dy(&ls, y));
         let ye_fixed = fixed(ls.ye_sign * (y as f32 - ls.ye + 1.0).clamp(0.0, 1.0));
@@ -232,18 +232,18 @@ pub fn entry_contrib(line: &[f32; 4], tx: u32, ty: u32, left_edge: bool) -> [i32
 }
 
 /// Unresolved per-pixel winding (fixed point) for a run, including backdrop.
-pub fn run_winding(scene: &Scene, tiled: &Tiled, run: &Run) -> [i32; 64] {
-    let mut acc = [0i32; 64];
+pub fn run_winding(scene: &Scene, tiled: &Tiled, run: &Run) -> [i32; PIXELS] {
+    let mut acc = [0i32; PIXELS];
     for e in &tiled.entries[run.entry_start as usize..run.entry_end as usize] {
         add_entry(scene, e, run, &mut acc);
     }
     acc
 }
 
-pub fn add_entry(scene: &Scene, e: &Entry, run: &Run, acc: &mut [i32; 64]) {
+pub fn add_entry(scene: &Scene, e: &Entry, run: &Run, acc: &mut [i32; PIXELS]) {
     let line = &scene.lines[(e.line & !LINE_LEFT_EDGE) as usize];
     let c = entry_contrib(line, run.tx, run.ty, e.line & LINE_LEFT_EDGE != 0);
-    for i in 0..64 {
+    for i in 0..PIXELS {
         acc[i] += c[i];
     }
     if e.backdrop != 0 {
@@ -268,13 +268,13 @@ pub fn resolve(w: i32, even_odd: bool) -> u8 {
 #[inline]
 pub fn coset_major_index(x: u32, y: u32) -> usize {
     let (c, p) = coset_of(x, y);
-    (c * 16 + p) as usize
+    (c * (TILE * TILE / 4) + p) as usize
 }
 
 /// Coset partition helpers (see handoff doc).
 #[inline]
 pub fn coset_of(x: u32, y: u32) -> (u32, u32) {
-    (2 * (x & 1) + (y & 1), (y >> 1) * 4 + (x >> 1))
+    (2 * (x & 1) + (y & 1), (y >> 1) * (TILE / 2) + (x >> 1))
 }
 
 /// Cells of each coset the (clipped, tile-local) line passes through, by the shader's

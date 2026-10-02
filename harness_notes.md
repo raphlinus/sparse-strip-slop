@@ -135,6 +135,25 @@ the output is needed. Chunk 1, 480K entries, median ms:
 
 First configuration where two lines per thread beats one line (by 6%).
 
+## Scale 8 (1600x1600) and 4x4 tiles
+
+Tile size is a cargo feature (`--features tile4`, build with a separate target dir). At
+4x4 the cosets are 4 cells each with at most 2 partial cells, chunks are 1 or 2, and a run's
+output is 4 u32. Same scene, 16x replicated, median ms:
+
+| tile | entries (natural) | runs   | one line ch1 | two lines ch1 | ns/entry (two) |
+|------|-------------------|--------|--------------|---------------|----------------|
+| 8x8  | 51K               | 26.5K  | 0.800        | 0.757         | 0.91           |
+| 4x4  | 86K               | 57.5K  | 0.484        | 0.432         | 0.31           |
+
+4x4 does 1.67x the entries but each costs a third as much, so the merge stage is 1.75x
+faster for the same scene. Alpha output is also smaller (57.5K x 16 B vs 26.5K x 64 B).
+Costs land elsewhere: 1.67x the tile/sort work, 2.2x the runs for strip allocation.
+Mean run length at 4x4 is 1.5, at 8x8 1.9.
+
+Natural (unreplicated) 1600x1600 tiger merge: 0.069 ms at 8x8 (latency bound, ~200
+workgroups), 1.33 ns/entry vs 0.91 saturated.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and

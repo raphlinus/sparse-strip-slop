@@ -1,11 +1,14 @@
 // Per-line setup and per-cell evaluation shared by the merge variants.
 // Appended after a header that defines WG_SIZE and CHUNK.
 
-const TILE: u32 = 8u;
 const FIXED_ONE: f32 = 65536.0;
 const LINE_LEFT_EDGE: u32 = 0x80000000u;
 const OUT_PARTIAL: u32 = 0x80000000u;
-const N_CHUNKS: u32 = 16u / CHUNK;
+// Coset geometry: HALF cells per coset row, N_POS cells per coset, FIFO depth HALF.
+const HALF: u32 = TILE / 2u;
+const N_POS: u32 = HALF * HALF;
+const PIXELS: u32 = TILE * TILE;
+const N_CHUNKS: u32 = N_POS / CHUNK;
 
 struct Entry {
     key: u32,
@@ -76,10 +79,10 @@ fn line_setup(e: Entry) -> LineSetup {
 
 // Coset walk: pos in 0..16 within coset c maps to pixel (x, y).
 fn coset_x(c: u32, pos: u32) -> u32 {
-    return 2u * (pos & 3u) + (c >> 1u);
+    return 2u * (pos % HALF) + (c >> 1u);
 }
 fn coset_y(c: u32, pos: u32) -> u32 {
-    return 2u * (pos >> 2u) + (c & 1u);
+    return 2u * (pos / HALF) + (c & 1u);
 }
 
 struct RowConsts {
@@ -153,13 +156,13 @@ fn coset_classify(ls: LineSetup, c: u32) -> CosetState {
     var hits = 0u;
     var sides = 0u;
     let a_pos = ls.a > 0.0;
-    for (var r = 0u; r < 4u; r++) {
+    for (var r = 0u; r < HALF; r++) {
         let y = 2u * r + (c & 1u);
         let t_y = ls.b * (f32(y) + 0.5) - ls.d;
-        for (var k = 0u; k < 4u; k++) {
+        for (var k = 0u; k < HALF; k++) {
             let x = 2u * k + (c >> 1u);
             let s = fma(ls.a, f32(x) + 0.5, t_y);
-            let pos = r * 4u + k;
+            let pos = r * HALF + k;
             hits |= u32(abs(s) < ls.h) << pos;
             sides |= u32((s > 0.0) == a_pos) << pos;
         }
@@ -177,7 +180,7 @@ fn coset_classify(ls: LineSetup, c: u32) -> CosetState {
 fn coset_fill(ls: LineSetup, c: u32, cs: ptr<function, CosetState>) {
     var m = (*cs).hits;
     var vals = array<i32, 4>(0, 0, 0, 0);
-    for (var i = 0u; i < 4u; i++) {
+    for (var i = 0u; i < HALF; i++) {
         let pos = firstTrailingBit(m);
         var v = 0;
         if m != 0u {
@@ -259,12 +262,12 @@ fn resolve(w: i32, even_odd: bool) -> u32 {
 fn store_result(e: Entry, even_odd: bool, vals: array<i32, CHUNK>, c: u32, ch: u32, pack: ptr<function, u32>) {
     let bd = e.backdrop * 65536;
     if (e.out & OUT_PARTIAL) != 0u {
-        let base = (e.out & ~OUT_PARTIAL) * 64u + c * 16u + ch * CHUNK;
+        let base = (e.out & ~OUT_PARTIAL) * PIXELS + c * N_POS + ch * CHUNK;
         for (var i = 0u; i < CHUNK; i++) {
             partials_out[base + i] = vals[i] + bd;
         }
     } else {
-        let base = e.out * 16u + c * 4u + (ch * CHUNK) / 4u;
+        let base = e.out * (PIXELS / 4u) + c * (N_POS / 4u) + (ch * CHUNK) / 4u;
         if CHUNK < 4u {
             let shift = 8u * ((ch * CHUNK) & 3u);
             for (var i = 0u; i < CHUNK; i++) {

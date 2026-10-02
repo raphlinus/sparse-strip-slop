@@ -10,6 +10,10 @@ png = "0.18"
 wgpu = "30"
 pollster = "0.4"
 
+[features]
+# Use 4x4 tiles instead of 8x8.
+tile4 = []
+
 [profile.dev]
 opt-level = 1
 

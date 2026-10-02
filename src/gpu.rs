@@ -2,7 +2,7 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::tiler::Entry;
+use crate::tiler::{Entry, PIXELS, TILE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -41,8 +41,8 @@ impl Variant {
 
     pub fn shader_source(&self) -> String {
         let header = format!(
-            "const WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\n",
-            self.wg_size, self.chunk, self.profile
+            "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\n",
+            TILE, self.wg_size, self.chunk, self.profile
         );
         let body = match self.mode {
             Mode::ComputeOnly => include_str!("../shader/merge0.wgsl"),
@@ -137,8 +137,8 @@ impl Gpu {
             contents: bytemuck::cast_slice(if path_flags.is_empty() { &[0u32] } else { path_flags }),
             usage: storage,
         });
-        let alpha_size = (n_alpha.max(1) as u64) * 64;
-        let partials_size = (n_partials.max(1) as u64) * 256;
+        let alpha_size = (n_alpha.max(1) as u64) * PIXELS as u64;
+        let partials_size = (n_partials.max(1) as u64) * PIXELS as u64 * 4;
         let alpha_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("alpha"),
             size: alpha_size,

@@ -1,7 +1,7 @@
 //! CPU stand-in for the tile, sort, and strip-allocation stages.
 //!
 //! Conventions (shared with the merge shader and the CPU reference):
-//! - Tiles are 8x8. A point at x belongs to tile `floor(x / 8)` (half-open).
+//! - Tiles are TILE x TILE (8 by default, 4 with the `tile4` feature). A point at x belongs to tile `floor(x / 8)` (half-open).
 //! - Winding sign: an upward line (y1 < y0) contributes +1 to pixels on its right,
 //!   matching `dy = clamp(y0) - clamp(y1)` in fill_path.
 //! - Backdrop of tile (tx, ty) = sum over lines crossing the row's top edge `y = 8 ty`
@@ -14,7 +14,8 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::scene::Scene;
 
-pub const TILE: u32 = 8;
+pub const TILE: u32 = if cfg!(feature = "tile4") { 4 } else { 8 };
+pub const PIXELS: usize = (TILE * TILE) as usize;
 pub const PIECE: usize = 8;
 pub const LINE_LEFT_EDGE: u32 = 1 << 31;
 pub const OUT_PARTIAL: u32 = 1 << 31;

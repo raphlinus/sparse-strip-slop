@@ -10,16 +10,16 @@ use composite::{Image, color_f32};
 use gpu::{Gpu, Mode, Variant};
 use reference::{FIXED_ONE, PathTruth, classify_hits, coset_major_index, resolve, run_winding};
 use scene::Scene;
-use tiler::{LINE_LEFT_EDGE, RunOutput, TILE, Tiled};
+use tiler::{LINE_LEFT_EDGE, PIXELS, RunOutput, TILE, Tiled};
 
 /// Resolved alpha per run, row-major within the tile.
-type RunAlphas = Vec<[u8; 64]>;
+type RunAlphas = Vec<[u8; PIXELS]>;
 
-fn reference_windings(scene: &Scene, tiled: &Tiled) -> Vec<[i32; 64]> {
+fn reference_windings(scene: &Scene, tiled: &Tiled) -> Vec<[i32; PIXELS]> {
     tiled.runs.iter().map(|r| run_winding(scene, tiled, r)).collect()
 }
 
-fn resolve_all(scene: &Scene, tiled: &Tiled, windings: &[[i32; 64]]) -> RunAlphas {
+fn resolve_all(scene: &Scene, tiled: &Tiled, windings: &[[i32; PIXELS]]) -> RunAlphas {
     tiled
         .runs
         .iter()
@@ -36,15 +36,15 @@ fn gpu_run_results(
     scene: &Scene,
     tiled: &Tiled,
     result: &gpu::GpuResult,
-) -> (Vec<Option<[i32; 64]>>, RunAlphas) {
+) -> (Vec<Option<[i32; PIXELS]>>, RunAlphas) {
     let mut windings = Vec::with_capacity(tiled.runs.len());
     let mut alphas = Vec::with_capacity(tiled.runs.len());
     for r in &tiled.runs {
         let eo = scene.paths[r.path as usize].even_odd;
         match r.output {
             RunOutput::Alpha(o) => {
-                let words = &result.alpha[o as usize * 16..o as usize * 16 + 16];
-                let mut a = [0u8; 64];
+                let words = &result.alpha[o as usize * (PIXELS / 4)..(o as usize + 1) * (PIXELS / 4)];
+                let mut a = [0u8; PIXELS];
                 for y in 0..TILE {
                     for x in 0..TILE {
                         let ci = coset_major_index(x, y);
@@ -55,9 +55,9 @@ fn gpu_run_results(
                 alphas.push(a);
             }
             RunOutput::Partials { first, count } => {
-                let mut w = [0i32; 64];
+                let mut w = [0i32; PIXELS];
                 for p in first..first + count {
-                    let vals = &result.partials[p as usize * 64..p as usize * 64 + 64];
+                    let vals = &result.partials[p as usize * PIXELS..(p as usize + 1) * PIXELS];
                     for y in 0..TILE {
                         for x in 0..TILE {
                             w[(y * TILE + x) as usize] += vals[coset_major_index(x, y)];
@@ -115,7 +115,7 @@ fn composite_and_check(scene: &Scene, tiled: &Tiled, alphas: &RunAlphas, check: 
                         if a == 0 {
                             continue;
                         }
-                        [a; 64]
+                        [a; PIXELS]
                     }
                 };
                 img.blend_tile(tx, ty, &alpha, color);
@@ -165,7 +165,7 @@ fn print_tiling_stats(tiled: &Tiled, scene: &Scene) {
     );
     println!("  run length histogram (1..8, 9+): {:?}", &hist[1..]);
     let mut max_hits = 0;
-    let mut hit_hist = [0usize; 17];
+    let mut hit_hist = [0usize; PIXELS / 4 + 1];
     for e in &tiled.entries {
         if e.key == tiler::SENTINEL_KEY {
             continue;
@@ -221,6 +221,7 @@ fn main() {
 
     let profile_only = std::env::var("PROFILE").is_ok();
     let profile_chunk: u32 = std::env::var("CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    println!("tile size {TILE}");
     let variants: Vec<Variant> = if profile_only {
         (0..=5)
             .map(|profile| Variant { mode: Mode::ComputeOnly, profile, wg_size: 256, chunk: profile_chunk })
@@ -241,17 +242,22 @@ fn main() {
         ]
     };
 
+    // A chunk must be a sub-row (<= TILE/2 cells) or whole rows (multiple of 4 at TILE 8).
+    let variants: Vec<Variant> = variants
+        .into_iter()
+        .filter(|v| v.chunk <= TILE / 2 || (TILE == 8 && v.chunk % 4 == 0))
+        .collect();
     let mut truth_written = false;
     for (vi, variant) in variants.iter().enumerate() {
         println!("== {} ==", variant.name());
         let t1 = std::time::Instant::now();
         let mut tiled = tiler::tile(&scene, variant.entries_per_wg());
         let t_tile = t1.elapsed();
-        if replicate > 1 {
-            tiler::replicate(&mut tiled, replicate, scene.paths.len() as u32);
-        }
         if vi == 0 {
             print_tiling_stats(&tiled, &scene);
+        }
+        if replicate > 1 {
+            tiler::replicate(&mut tiled, replicate, scene.paths.len() as u32);
         }
         let t2 = std::time::Instant::now();
         let ref_w = reference_windings(&scene, &tiled);
@@ -314,7 +320,7 @@ fn main() {
         let mut first_bad: Option<usize> = None;
         for ri in 0..tiled.runs.len() {
             let mut bad = false;
-            for i in 0..64 {
+            for i in 0..PIXELS {
                 let d = gpu_alpha[ri][i].abs_diff(ref_alpha[ri][i]);
                 if d != 0 {
                     bad = true;
@@ -346,9 +352,10 @@ fn main() {
                 "  first mismatch: run {} path {} tile ({}, {}) entries {}..{} output {:?}",
                 ri, r.path, r.tx, r.ty, r.entry_start, r.entry_end, r.output
             );
-            for y in 0..8 {
-                let row: Vec<String> = (0..8)
-                    .map(|x| format!("{:3}/{:3}", gpu_alpha[ri][y * 8 + x], ref_alpha[ri][y * 8 + x]))
+            let t = TILE as usize;
+            for y in 0..t {
+                let row: Vec<String> = (0..t)
+                    .map(|x| format!("{:3}/{:3}", gpu_alpha[ri][y * t + x], ref_alpha[ri][y * t + x]))
                     .collect();
                 println!("    {}", row.join(" "));
             }

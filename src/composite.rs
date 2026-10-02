@@ -2,7 +2,7 @@
 
 use vello_common::peniko::color::{AlphaColor, Srgb};
 
-use crate::tiler::TILE;
+use crate::tiler::{PIXELS, TILE};
 
 pub struct Image {
     pub width: u32,
@@ -33,7 +33,7 @@ impl Image {
     }
 
     /// Blend a tile given alpha in row-major (y * 8 + x) order.
-    pub fn blend_tile(&mut self, tx: u32, ty: u32, alpha: &[u8; 64], color: [f32; 4]) {
+    pub fn blend_tile(&mut self, tx: u32, ty: u32, alpha: &[u8; PIXELS], color: [f32; 4]) {
         for y in 0..TILE {
             for x in 0..TILE {
                 self.blend(tx * TILE + x, ty * TILE + y, alpha[(y * TILE + x) as usize], color);
