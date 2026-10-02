@@ -101,6 +101,25 @@ chunk 4, 16 at chunk 8). Chunk 4 is one coset row, so row constants are computed
 per chunk. Chunk 8 has been consistently slower, so barriers are not the bottleneck
 here; register pressure from the larger arrays is the likelier cost.
 
+## Chunk 1 and 2 (CHUNK below 4 supported via atomicOr sub-word alpha stores)
+
+Full merge, 480K entries, wg256, median ms:
+
+| chunk | one line | two lines | phase-2 floor (compute only) | merge overhead |
+|-------|----------|-----------|------------------------------|----------------|
+| 1     | 0.503    | 0.492     | 0.430                        | 0.07           |
+| 2     | 0.918    | 0.913     | 0.645                        | 0.27           |
+| 4     | 0.661    | 0.664     | 0.468                        | 0.19           |
+| 8     | 0.793    | 0.837     |                              |                |
+
+Chunk 1 is fastest despite 128 barriers per thread, and chunk 2 is slowest. The ordering
+tracks how the `array<i32, CHUNK>` values are handled, not the barrier count: at chunk 1
+every array is a scalar, at chunk 4 the cells are written explicitly, and chunk 2 goes
+through a dynamically indexed loop (stack). Barriers and workgroup atomics are cheap on
+this GPU: the entire slot/atomic/barrier overhead at chunk 1 is 0.07 ms, 14% of the total.
+Conclusion so far: on Apple silicon the design should minimize per-thread array state;
+per-pixel processing with scalar registers beats batching pixels per barrier.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and

@@ -220,9 +220,10 @@ fn main() {
     }
 
     let profile_only = std::env::var("PROFILE").is_ok();
+    let profile_chunk: u32 = std::env::var("CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let variants: Vec<Variant> = if profile_only {
         (0..=5)
-            .map(|profile| Variant { mode: Mode::ComputeOnly, profile, wg_size: 256, chunk: 4 })
+            .map(|profile| Variant { mode: Mode::ComputeOnly, profile, wg_size: 256, chunk: profile_chunk })
             .collect()
     } else {
         vec![
@@ -233,6 +234,10 @@ fn main() {
             Variant { mode: Mode::TwoLines, profile: 0, wg_size: 256, chunk: 8 },
             Variant { mode: Mode::OneLine, profile: 0, wg_size: 128, chunk: 4 },
             Variant { mode: Mode::TwoLines, profile: 0, wg_size: 128, chunk: 4 },
+            Variant { mode: Mode::OneLine, profile: 0, wg_size: 256, chunk: 2 },
+            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 256, chunk: 2 },
+            Variant { mode: Mode::OneLine, profile: 0, wg_size: 256, chunk: 1 },
+            Variant { mode: Mode::TwoLines, profile: 0, wg_size: 256, chunk: 1 },
         ]
     };
 

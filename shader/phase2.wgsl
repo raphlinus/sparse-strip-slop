@@ -16,7 +16,7 @@ struct Entry {
 
 @group(0) @binding(0) var<storage, read> lines: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> entries: array<Entry>;
-@group(0) @binding(2) var<storage, read_write> alpha_out: array<u32>;
+@group(0) @binding(2) var<storage, read_write> alpha_out: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> partials_out: array<i32>;
 @group(0) @binding(4) var<storage, read> path_flags: array<u32>;
 
@@ -222,6 +222,15 @@ fn cell_value(cs: ptr<function, CosetState>, pos: u32, rc: RowConsts) -> i32 {
 // CHUNK / 4 coset rows; cells within a row are written out explicitly.
 fn compute_chunk(ls: LineSetup, cs: ptr<function, CosetState>, c: u32, ch: u32) -> array<i32, CHUNK> {
     var out: array<i32, CHUNK>;
+    if CHUNK < 4u {
+        // Sub-row chunk: all cells share one row.
+        let pos = ch * CHUNK;
+        let rc = row_consts(ls, coset_y(c, pos));
+        for (var i = 0u; i < CHUNK; i++) {
+            out[i] = cell_value(cs, pos + i, rc);
+        }
+        return out;
+    }
     for (var r = 0u; r < CHUNK / 4u; r++) {
         let pos = ch * CHUNK + r * 4u;
         let rc = row_consts(ls, coset_y(c, pos));
@@ -254,12 +263,22 @@ fn store_result(e: Entry, even_odd: bool, vals: array<i32, CHUNK>, c: u32, ch: u
         }
     } else {
         let base = e.out * 16u + c * 4u + (ch * CHUNK) / 4u;
+        if CHUNK < 4u {
+            // Partial word: OR the bytes into the (zero-initialized) output.
+            let shift = 8u * ((ch * CHUNK) & 3u);
+            var packed = 0u;
+            for (var i = 0u; i < CHUNK; i++) {
+                packed |= resolve(vals[i] + bd, even_odd) << (shift + 8u * i);
+            }
+            atomicOr(&alpha_out[base], packed);
+            return;
+        }
         for (var g = 0u; g < CHUNK / 4u; g++) {
             var packed = 0u;
             for (var i = 0u; i < 4u; i++) {
                 packed |= resolve(vals[g * 4u + i] + bd, even_odd) << (8u * i);
             }
-            alpha_out[base + g] = packed;
+            atomicStore(&alpha_out[base + g], packed);
         }
     }
 }
