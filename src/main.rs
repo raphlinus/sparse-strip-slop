@@ -1,5 +1,6 @@
 mod composite;
 mod gpu;
+mod msaa;
 mod reference;
 mod scene;
 mod tiler;
@@ -207,6 +208,10 @@ fn print_tiling_stats(tiled: &Tiled, scene: &Scene) {
 }
 
 fn main() {
+    if std::env::var("MSAA").is_ok() {
+        msaa_main();
+        return;
+    }
     let args: Vec<String> = std::env::args().collect();
     let svg = args
         .get(1)
@@ -242,10 +247,10 @@ fn main() {
     let profile_only = std::env::var("PROFILE").is_ok();
     let profile_chunk: u32 = std::env::var("CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let profile_dense = std::env::var("DENSE").is_ok();
-    let v = |mode: Mode, chunk: u32, dense: bool| Variant { mode, profile: 5, dense, quad_slots: 3, wg_size: 256, chunk };
+    let v = |mode: Mode, chunk: u32, dense: bool| Variant { mode, profile: 5, dense, quad_slots: 3, cell_mode: 0, wg_size: 256, chunk };
     let variants: Vec<Variant> = if profile_only {
         (0..=5)
-            .map(|profile| Variant { mode: Mode::ComputeOnly, profile, dense: profile_dense, quad_slots: 3, wg_size: 256, chunk: profile_chunk })
+            .map(|profile| Variant { mode: Mode::ComputeOnly, profile, dense: profile_dense, quad_slots: 3, cell_mode: 0, wg_size: 256, chunk: profile_chunk })
             .collect()
     } else {
         vec![
@@ -287,6 +292,7 @@ fn main() {
             tiled.n_alpha,
             tiled.n_partials,
             iterations,
+            None,
         );
         if !result.times_ms.is_empty() {
             // Skip warm-up iterations; the first timestamp pair is also unreliable on Metal.
@@ -403,6 +409,256 @@ fn main() {
             );
             img_ref.write_png(&format!("{out_dir}/reference.png"));
             truth_written = true;
+        }
+    }
+}
+
+/// MSAA 16 path: CPU reference against the sample-point oracle, then GPU variants.
+fn msaa_main() {
+    let args: Vec<String> = std::env::args().collect();
+    let svg = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "/Users/raphl/gh/vello/assets/Ghostscript_Tiger.svg".into());
+    let scale: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4.0);
+    let out_dir = args.get(3).cloned().unwrap_or_else(|| "out".into());
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let scene = scene::load_svg(&svg, scale);
+    println!("scene {}x{}: {} paths, {} lines", scene.width, scene.height, scene.paths.len(), scene.lines.len());
+    let lut = msaa::make_mask_lut_16();
+    let tiled = tiler::tile(&scene, 256, tiler::PIECE);
+    println!("tiles: {} entries, {} runs", tiled.entries.len(), tiled.runs.len());
+
+    // CPU reference masks per run.
+    let t0 = std::time::Instant::now();
+    let ref_masks: Vec<[u16; PIXELS]> = tiled
+        .runs
+        .iter()
+        .map(|r| {
+            let eo = scene.paths[r.path as usize].even_odd;
+            let w = msaa::run_sample_winding(&lut, &scene, &tiled, r);
+            std::array::from_fn(|i| msaa::resolve_mask(&w[i], eo))
+        })
+        .collect();
+    println!("cpu msaa reference: {:.1?}", t0.elapsed());
+
+    // Compare with the sample oracle and composite.
+    let t1 = std::time::Instant::now();
+    let mut img = Image::new(scene.width, scene.height);
+    let mut img_truth = Image::new(scene.width, scene.height);
+    let mut n_pixels = 0usize;
+    let mut n_pixels_diff = 0usize;
+    let mut n_samples_diff = 0usize;
+    let mut max_samples_diff = 0u32;
+    let mut worst: Option<(u32, u32, u32)> = None;
+    let mut run_ix = 0;
+    for (path_ix, path) in scene.paths.iter().enumerate() {
+        let color = color_f32(path.color);
+        let bd = &tiled.backdrops[path_ix];
+        let x0 = bd.tx0 * TILE;
+        let y0 = bd.ty0 * TILE;
+        let w = (bd.w * TILE).min(scene.width.saturating_sub(x0));
+        let h = (bd.h * TILE).min(scene.height.saturating_sub(y0));
+        let lines = &scene.lines[path.line_start as usize..path.line_end as usize];
+        let truth = msaa::SampleTruth::compute(lines, x0, y0, w, h);
+        let mut by_tile: HashMap<(u32, u32), usize> = HashMap::new();
+        while run_ix < tiled.runs.len() && tiled.runs[run_ix].path == path_ix as u32 {
+            let run = &tiled.runs[run_ix];
+            by_tile.insert((run.tx, run.ty), run_ix);
+            run_ix += 1;
+        }
+        for ty in bd.ty0..bd.ty0 + bd.h {
+            for tx in bd.tx0..bd.tx0 + bd.w {
+                let masks: [u16; PIXELS] = match by_tile.get(&(tx, ty)) {
+                    Some(&ri) => ref_masks[ri],
+                    None => {
+                        let bdv = bd.get(tx, ty);
+                        let covered = if path.even_odd { bdv & 1 != 0 } else { bdv != 0 };
+                        if !covered {
+                            continue;
+                        }
+                        [0xffff; PIXELS]
+                    }
+                };
+                let alpha: [u8; PIXELS] = std::array::from_fn(|i| msaa::mask_alpha(masks[i]));
+                img.blend_tile(tx, ty, &alpha, color);
+                let mut tile_diff = 0u32;
+                for y in 0..TILE {
+                    for x in 0..TILE {
+                        let px = tx * TILE + x;
+                        let py = ty * TILE + y;
+                        if px >= scene.width || py >= scene.height {
+                            continue;
+                        }
+                        let t = truth.mask(px, py, path.even_odd);
+                        img_truth.blend(px, py, msaa::mask_alpha(t), color);
+                        let d = (t ^ masks[(y * TILE + x) as usize]).count_ones();
+                        n_pixels += 1;
+                        n_pixels_diff += (d > 0) as usize;
+                        n_samples_diff += d as usize;
+                        max_samples_diff = max_samples_diff.max(d);
+                        tile_diff += d;
+                    }
+                }
+                if tile_diff > 0 && worst.is_none_or(|(_, _, d)| tile_diff > d) {
+                    worst = Some((tx, ty, tile_diff));
+                }
+            }
+        }
+    }
+    println!(
+        "reference vs sample oracle over {} pixels: {} pixels differ ({:.3}%), {} samples differ ({:.4}% of samples), max {} samples in one pixel ({:.1?})",
+        n_pixels,
+        n_pixels_diff,
+        100.0 * n_pixels_diff as f64 / n_pixels as f64,
+        n_samples_diff,
+        100.0 * n_samples_diff as f64 / (16 * n_pixels) as f64,
+        max_samples_diff,
+        t1.elapsed()
+    );
+    if let Some((tx, ty, d)) = worst {
+        println!("worst tile ({}, {}): {} samples differ", tx, ty, d);
+    }
+    img.write_png(&format!("{out_dir}/msaa_reference.png"));
+    img_truth.write_png(&format!("{out_dir}/msaa_truth.png"));
+    println!("wrote {out_dir}/msaa_reference.png and {out_dir}/msaa_truth.png");
+
+    // GPU variants.
+    let iterations: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let replicate: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let gpu = Gpu::new();
+    let lut_packed = msaa::pack_lut(&lut);
+    let path_flags: Vec<u32> = (0..replicate)
+        .flat_map(|_| scene.paths.iter().map(|p| p.even_odd as u32))
+        .collect();
+    let mut lines_padded = scene.lines.clone();
+    lines_padded.push([0.0; 4]);
+    let mut tiled = tiled;
+    if replicate > 1 {
+        tiler::replicate(&mut tiled, replicate, scene.paths.len() as u32);
+    }
+    for cell_mode in 0..3u32 {
+        let variant = Variant {
+            mode: Mode::Msaa,
+            profile: 0,
+            dense: false,
+            quad_slots: 3,
+            cell_mode,
+            wg_size: 256,
+            chunk: 1,
+        };
+        println!("== {} ==", variant.name());
+        let result = gpu.run(
+            variant,
+            &lines_padded,
+            &tiled.entries,
+            &path_flags,
+            tiled.n_alpha,
+            tiled.n_partials,
+            iterations,
+            Some(&lut_packed),
+        );
+        if !result.times_ms.is_empty() {
+            let skip = 1;
+            let mut t: Vec<f64> = result.times_ms[skip..].iter().copied().filter(|&t| t > 0.0).collect();
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "  gpu: {} entries, min {:.3} ms, median {:.3} ms, max {:.3} ms ({:.2} ns/entry)",
+                tiled.entries.len(),
+                t[0],
+                t[t.len() / 2],
+                t[t.len() - 1],
+                t[t.len() / 2] * 1e6 / tiled.entries.len() as f64
+            );
+        }
+        // Compare GPU masks with the CPU reference (exact), folding partials.
+        let mut runs_diff = 0usize;
+        let mut pixels_diff = 0usize;
+        let mut samples_diff = 0usize;
+        let mut worst: Option<(usize, u32)> = None;
+        let mut gpu_masks: Vec<[u16; PIXELS]> = Vec::with_capacity(tiled.runs.len());
+        for (ri, r) in tiled.runs.iter().enumerate() {
+            let eo = scene.paths[r.path as usize].even_odd;
+            let mut m = [0u16; PIXELS];
+            match r.output {
+                RunOutput::Alpha(o) => {
+                    let words = &result.alpha[o as usize * (PIXELS / 2)..(o as usize + 1) * (PIXELS / 2)];
+                    for y in 0..TILE {
+                        for x in 0..TILE {
+                            let ci = variant.layout_index(x, y);
+                            m[(y * TILE + x) as usize] = (words[ci / 2] >> (16 * (ci % 2))) as u16;
+                        }
+                    }
+                }
+                RunOutput::Partials { first, count } => {
+                    for y in 0..TILE {
+                        for x in 0..TILE {
+                            let ci = variant.layout_index(x, y);
+                            let mut w = [0i32; 16];
+                            for p in first..first + count {
+                                let base = (p as usize * PIXELS + ci) * 16;
+                                for sidx in 0..16 {
+                                    w[sidx] += result.partials[base + sidx];
+                                }
+                            }
+                            m[(y * TILE + x) as usize] = msaa::resolve_mask(&w, eo);
+                        }
+                    }
+                }
+            }
+            let mut d_run = 0u32;
+            for i in 0..PIXELS {
+                let d = (m[i] ^ ref_masks[ri][i]).count_ones();
+                d_run += d;
+                pixels_diff += (d > 0) as usize;
+                samples_diff += d as usize;
+            }
+            if d_run > 0 {
+                runs_diff += 1;
+                if worst.is_none_or(|(_, b)| d_run > b) {
+                    worst = Some((ri, d_run));
+                }
+            }
+            gpu_masks.push(m);
+        }
+        println!(
+            "  gpu vs reference: {} of {} runs differ, {} pixels, {} samples",
+            runs_diff,
+            tiled.runs.len(),
+            pixels_diff,
+            samples_diff
+        );
+        if let Some((ri, d)) = worst {
+            let r = &tiled.runs[ri];
+            println!(
+                "  worst: run {} path {} tile ({}, {}) entries {}..{} output {:?}: {} samples",
+                ri, r.path, r.tx, r.ty, r.entry_start, r.entry_end, r.output, d
+            );
+            for e in &tiled.entries[r.entry_start as usize..r.entry_end as usize] {
+                let l = scene.lines[(e.line & !LINE_LEFT_EDGE) as usize];
+                let ox = r.tx as f32 * TILE as f32;
+                let oy = r.ty as f32 * TILE as f32;
+                println!(
+                    "    entry: line {} local ({:.3}, {:.3}) -> ({:.3}, {:.3}) left_edge {} backdrop {}",
+                    e.line & !LINE_LEFT_EDGE, l[0] - ox, l[1] - oy, l[2] - ox, l[3] - oy,
+                    e.line & LINE_LEFT_EDGE != 0, e.backdrop
+                );
+            }
+            for y in 0..TILE as usize {
+                let row: Vec<String> = (0..TILE as usize)
+                    .map(|x| format!("{:04x}/{:04x}", gpu_masks[ri][y * 8 + x], ref_masks[ri][y * 8 + x]))
+                    .collect();
+                println!("    {}", row.join(" "));
+            }
+        }
+        if cell_mode == 0 {
+            let alphas: Vec<[u8; PIXELS]> = gpu_masks
+                .iter()
+                .map(|m| std::array::from_fn(|i| msaa::mask_alpha(m[i])))
+                .collect();
+            let (img_gpu, _) = composite_and_check(&scene, &tiled, &alphas, false);
+            img_gpu.write_png(&format!("{out_dir}/msaa_gpu.png"));
         }
     }
 }

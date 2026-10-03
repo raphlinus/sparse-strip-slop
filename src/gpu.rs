@@ -14,6 +14,8 @@ pub enum Mode {
     Simple,
     /// 8x8 entries expanded to 4x4 quadrant items with load balancing (TILE must be 8).
     Quadrant,
+    /// MSAA 16 payload, one entry per thread, chunk 1; `cell_mode` selects the per-cell method.
+    Msaa,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -26,6 +28,8 @@ pub struct Variant {
     /// Quadrant mode: item slots per thread (3 => entries per workgroup = threads,
     /// 2 => entries = threads / 2).
     pub quad_slots: u32,
+    /// Msaa mode: 0 inline LUT, 1 coset FIFO of LUT masks, 2 direct 16-sample evaluation.
+    pub cell_mode: u32,
     pub wg_size: u32,
     pub chunk: u32,
 }
@@ -61,10 +65,15 @@ impl Variant {
             Mode::TwoLines => "twoline",
             Mode::Simple => "simple",
             Mode::Quadrant => "quadrant",
+            Mode::Msaa => "msaa",
         };
         let dense = if self.dense { "_dense" } else { "" };
         if self.mode == Mode::Quadrant {
             return format!("{mode}_wg{}_e{}", self.wg_size, self.entries_per_wg());
+        }
+        if self.mode == Mode::Msaa {
+            let cm = ["inlinelut", "fifolut", "direct"][self.cell_mode as usize];
+            return format!("{mode}_{cm}_wg{}", self.wg_size);
         }
         if self.mode == Mode::Simple {
             return format!("{mode}_wg{}", self.wg_size);
@@ -81,6 +90,15 @@ impl Variant {
             "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\nconst DENSE: u32 = {}u;\n",
             TILE, self.wg_size, self.chunk, self.profile, self.dense as u32
         );
+        if self.mode == Mode::Msaa {
+            return format!(
+                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\n{}",
+                TILE,
+                self.wg_size,
+                self.cell_mode,
+                include_str!("../shader/msaa1.wgsl")
+            );
+        }
         if self.mode == Mode::Simple || self.mode == Mode::Quadrant {
             let body = if self.mode == Mode::Simple {
                 include_str!("../shader/merge_simple.wgsl")
@@ -100,7 +118,7 @@ impl Variant {
             Mode::ComputeOnly => include_str!("../shader/merge0.wgsl"),
             Mode::OneLine => include_str!("../shader/merge1.wgsl"),
             Mode::TwoLines => include_str!("../shader/merge2.wgsl"),
-            Mode::Simple | Mode::Quadrant => unreachable!(),
+            Mode::Simple | Mode::Quadrant | Mode::Msaa => unreachable!(),
         };
         format!("{header}{}\n{body}", include_str!("../shader/phase2.wgsl"))
     }
@@ -156,6 +174,7 @@ impl Gpu {
         n_alpha: u32,
         n_partials: u32,
         iterations: u32,
+        lut: Option<&[u32]>,
     ) -> GpuResult {
         let device = &self.device;
         assert_eq!(entries.len() % variant.entries_per_wg(), 0);
@@ -190,8 +209,13 @@ impl Gpu {
             contents: bytemuck::cast_slice(if path_flags.is_empty() { &[0u32] } else { path_flags }),
             usage: storage,
         });
-        let alpha_size = (n_alpha.max(1) as u64) * PIXELS as u64;
-        let partials_size = (n_partials.max(1) as u64) * PIXELS as u64 * 4;
+        // Area: 1 byte per pixel, 4 bytes per partial sample. MSAA: 2 bytes per pixel
+        // (16-bit mask), 16 x 4 bytes per partial pixel.
+        let (alpha_size, partials_size) = if variant.mode == Mode::Msaa {
+            ((n_alpha.max(1) as u64) * PIXELS as u64 * 2, (n_partials.max(1) as u64) * PIXELS as u64 * 64)
+        } else {
+            ((n_alpha.max(1) as u64) * PIXELS as u64, (n_partials.max(1) as u64) * PIXELS as u64 * 4)
+        };
         let alpha_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("alpha"),
             size: alpha_size,
@@ -211,10 +235,14 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
+        let lut_buf = lut.map(|l| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mask_lut"),
+                contents: bytemuck::cast_slice(l),
+                usage: storage,
+            })
+        });
+        let mut bind_entries = vec![
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: lines_buf.as_entire_binding(),
@@ -235,7 +263,17 @@ impl Gpu {
                     binding: 4,
                     resource: flags_buf.as_entire_binding(),
                 },
-            ],
+        ];
+        if let Some(lb) = &lut_buf {
+            bind_entries.push(wgpu::BindGroupEntry {
+                binding: 5,
+                resource: lb.as_entire_binding(),
+            });
+        }
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &bind_entries,
         });
 
         let n_queries = 2 * iterations;
