@@ -271,6 +271,63 @@ pub fn coset_major_index(x: u32, y: u32) -> usize {
     (c * (TILE * TILE / 4) + p) as usize
 }
 
+/// Index of pixel (x, y) in the quadrant-major layout used by the quadrant variant
+/// (8x8 tiles only): q * 16 + ly * 4 + lx with q = 2 * (y / 4) + x / 4.
+#[inline]
+pub fn quadrant_major_index(x: u32, y: u32) -> usize {
+    let q = 2 * (y >> 2) + (x >> 2);
+    (q * 16 + (y & 3) * 4 + (x & 3)) as usize
+}
+
+/// Quadrants of an 8x8 tile touched by the line, by the 4x4 tiler's rule applied inside
+/// the tile (mirrors the shader's expansion). Bit q = 2 * qy + qx.
+pub fn quadrants_touched(line: &[f32; 4], tx: u32, ty: u32) -> u32 {
+    let tf = TILE as f32;
+    let p0 = [line[0] - tx as f32 * tf, line[1] - ty as f32 * tf];
+    let p1 = [line[2] - tx as f32 * tf, line[3] - ty as f32 * tf];
+    let d = [p1[0] - p0[0], p1[1] - p0[1]];
+    let (mut c0, mut c1) = (p0, p1);
+    if d[0] != 0.0 {
+        let ta = (0.0 - p0[0]) / d[0];
+        let tb = (8.0 - p0[0]) / d[0];
+        let t_lo = ta.min(tb).max(0.0);
+        let t_hi = ta.max(tb).min(1.0).max(t_lo);
+        c0 = [p0[0] + t_lo * d[0], p0[1] + t_lo * d[1]];
+        c1 = [p0[0] + t_hi * d[0], p0[1] + t_hi * d[1]];
+    }
+    let (ymin, ymax) = (c0[1].min(c1[1]), c0[1].max(c1[1]));
+    let x_at = |y: f32| {
+        if y == p0[1] {
+            p0[0]
+        } else if y == p1[1] {
+            p1[0]
+        } else {
+            p0[0] + (y - p0[1]) * (d[0] / d[1])
+        }
+    };
+    let mut mask = 0;
+    for qy in 0..2u32 {
+        let top = 4.0 * qy as f32;
+        let bot = top + 4.0;
+        if ymin < bot && ymax > top {
+            let ya = ymin.max(top);
+            let yb = ymax.min(bot);
+            let (mut xa, mut xb) = (c0[0].min(c1[0]), c0[0].max(c1[0]));
+            if d[1] != 0.0 {
+                let (x1, x2) = (x_at(ya), x_at(yb));
+                xa = x1.min(x2);
+                xb = x1.max(x2);
+            }
+            let qa = (xa * 0.25).floor().clamp(0.0, 1.0) as u32;
+            let qb = (xb * 0.25).floor().clamp(0.0, 1.0) as u32;
+            for qx in qa..=qb {
+                mask |= 1 << (2 * qy + qx);
+            }
+        }
+    }
+    mask
+}
+
 /// Coset partition helpers (see handoff doc).
 #[inline]
 pub fn coset_of(x: u32, y: u32) -> (u32, u32) {

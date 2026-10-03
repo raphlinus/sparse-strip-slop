@@ -94,7 +94,7 @@ pub const SENTINEL_KEY: u32 = u32::MAX;
 
 /// `entries_per_wg` is the number of entries one workgroup consumes; pieces are split at
 /// those boundaries so the shader's local piece-boundary rule matches this allocation.
-pub fn tile(scene: &Scene, entries_per_wg: usize) -> Tiled {
+pub fn tile(scene: &Scene, entries_per_wg: usize, piece_size: usize) -> Tiled {
     let width_tiles = scene.width.div_ceil(TILE);
     let height_tiles = scene.height.div_ceil(TILE);
     let tf = TILE as f32;
@@ -213,7 +213,7 @@ pub fn tile(scene: &Scene, entries_per_wg: usize) -> Tiled {
             if k == i || k % entries_per_wg == 0 {
                 seg_start = k;
                 piece_starts.push(k);
-            } else if (k - seg_start) % PIECE == 0 {
+            } else if (k - seg_start) % piece_size == 0 {
                 piece_starts.push(k);
             }
         }

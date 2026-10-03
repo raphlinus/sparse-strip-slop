@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use composite::{Image, color_f32};
 use gpu::{Gpu, Mode, Variant};
-use reference::{FIXED_ONE, PathTruth, classify_hits, coset_major_index, resolve, run_winding};
+use reference::{FIXED_ONE, PathTruth, classify_hits, quadrants_touched, resolve, run_winding};
 use scene::Scene;
 use tiler::{LINE_LEFT_EDGE, PIXELS, RunOutput, TILE, Tiled};
 
@@ -36,6 +36,7 @@ fn gpu_run_results(
     scene: &Scene,
     tiled: &Tiled,
     result: &gpu::GpuResult,
+    variant: &Variant,
 ) -> (Vec<Option<[i32; PIXELS]>>, RunAlphas) {
     let mut windings = Vec::with_capacity(tiled.runs.len());
     let mut alphas = Vec::with_capacity(tiled.runs.len());
@@ -47,7 +48,7 @@ fn gpu_run_results(
                 let mut a = [0u8; PIXELS];
                 for y in 0..TILE {
                     for x in 0..TILE {
-                        let ci = coset_major_index(x, y);
+                        let ci = variant.layout_index(x, y);
                         a[(y * TILE + x) as usize] = (words[ci / 4] >> (8 * (ci % 4))) as u8;
                     }
                 }
@@ -60,7 +61,7 @@ fn gpu_run_results(
                     let vals = &result.partials[p as usize * PIXELS..(p as usize + 1) * PIXELS];
                     for y in 0..TILE {
                         for x in 0..TILE {
-                            w[(y * TILE + x) as usize] += vals[coset_major_index(x, y)];
+                            w[(y * TILE + x) as usize] += vals[variant.layout_index(x, y)];
                         }
                     }
                 }
@@ -179,6 +180,25 @@ fn print_tiling_stats(tiled: &Tiled, scene: &Scene) {
             max_hits = max_hits.max(n);
         }
     }
+    if TILE == 8 {
+        let mut items = 0usize;
+        let mut max_q = 0u32;
+        let mut hist = [0usize; 5];
+        for e in &tiled.entries {
+            if e.key == tiler::SENTINEL_KEY {
+                continue;
+            }
+            let line = &scene.lines[(e.line & !LINE_LEFT_EDGE) as usize];
+            let n = quadrants_touched(line, e.key & 0x3ff, (e.key >> 10) & 0x3ff).count_ones();
+            items += n as usize;
+            max_q = max_q.max(n);
+            hist[n as usize] += 1;
+        }
+        println!(
+            "  quadrant items: {} (max {} per entry, histogram by count {:?})",
+            items, max_q, hist
+        );
+    }
     println!(
         "  partial cells per (entry, coset): max {}, histogram {:?}",
         max_hits,
@@ -222,30 +242,30 @@ fn main() {
     let profile_only = std::env::var("PROFILE").is_ok();
     let profile_chunk: u32 = std::env::var("CHUNK").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     let profile_dense = std::env::var("DENSE").is_ok();
-    let v = |mode: Mode, chunk: u32, dense: bool| Variant { mode, profile: 5, dense, wg_size: 256, chunk };
+    let v = |mode: Mode, chunk: u32, dense: bool| Variant { mode, profile: 5, dense, quad_slots: 3, wg_size: 256, chunk };
     let variants: Vec<Variant> = if profile_only {
         (0..=5)
-            .map(|profile| Variant { mode: Mode::ComputeOnly, profile, dense: profile_dense, wg_size: 256, chunk: profile_chunk })
+            .map(|profile| Variant { mode: Mode::ComputeOnly, profile, dense: profile_dense, quad_slots: 3, wg_size: 256, chunk: profile_chunk })
             .collect()
     } else {
         vec![
-            v(Mode::Simple, 1, false),
-            v(Mode::OneLine, 1, false),
+            v(Mode::Quadrant, 1, true),
+            Variant { quad_slots: 2, ..v(Mode::Quadrant, 1, true) },
             v(Mode::OneLine, 1, true),
-            v(Mode::TwoLines, 1, false),
             v(Mode::TwoLines, 1, true),
+            v(Mode::Simple, 1, false),
         ]
     };
     // A chunk must be a sub-row (<= TILE/2 cells) or whole rows (multiple of 4 at TILE 8).
     let variants: Vec<Variant> = variants
         .into_iter()
-        .filter(|v| v.chunk <= TILE / 2 || (TILE == 8 && v.chunk % 4 == 0))
+        .filter(|v| (v.chunk <= TILE / 2 || (TILE == 8 && v.chunk % 4 == 0)) && (v.mode != Mode::Quadrant || TILE == 8))
         .collect();
     let mut truth_written = false;
     for (vi, variant) in variants.iter().enumerate() {
         println!("== {} ==", variant.name());
         let t1 = std::time::Instant::now();
-        let mut tiled = tiler::tile(&scene, variant.entries_per_wg());
+        let mut tiled = tiler::tile(&scene, variant.entries_per_wg(), variant.piece_size());
         let t_tile = t1.elapsed();
         if vi == 0 {
             print_tiling_stats(&tiled, &scene);
@@ -306,32 +326,33 @@ fn main() {
             continue;
         }
         // Compare GPU with the CPU reference, run by run.
-        let (gpu_w, gpu_alpha) = gpu_run_results(&scene, &tiled, &result);
+        let (gpu_w, gpu_alpha) = gpu_run_results(&scene, &tiled, &result, variant);
         let mut alpha_mismatch_runs = 0usize;
         let mut alpha_max = 0u8;
         let mut alpha_pixels_off = 0usize;
         let mut winding_max = 0i32;
-        let mut first_bad: Option<usize> = None;
+        let mut worst: Option<(usize, u8)> = None;
         for ri in 0..tiled.runs.len() {
-            let mut bad = false;
+            let mut bad = 0u8;
             for i in 0..PIXELS {
                 let d = gpu_alpha[ri][i].abs_diff(ref_alpha[ri][i]);
                 if d != 0 {
-                    bad = true;
                     alpha_pixels_off += 1;
                     alpha_max = alpha_max.max(d);
+                    bad = bad.max(d);
                 }
                 if let Some(w) = gpu_w[ri] {
                     winding_max = winding_max.max((w[i] - ref_w[ri][i]).abs());
                 }
             }
-            if bad {
+            if bad > 0 {
                 alpha_mismatch_runs += 1;
-                if first_bad.is_none() {
-                    first_bad = Some(ri);
+                if worst.is_none_or(|(_, b)| bad > b) {
+                    worst = Some((ri, bad));
                 }
             }
         }
+        let first_bad = worst.map(|(ri, _)| ri);
         println!(
             "  gpu vs reference: {} of {} runs differ ({} pixels, max alpha diff {}); max partial winding diff {} (fixed units)",
             alpha_mismatch_runs,
@@ -343,9 +364,22 @@ fn main() {
         if let Some(ri) = first_bad {
             let r = &tiled.runs[ri];
             println!(
-                "  first mismatch: run {} path {} tile ({}, {}) entries {}..{} output {:?}",
+                "  worst mismatch: run {} path {} tile ({}, {}) entries {}..{} output {:?}",
                 ri, r.path, r.tx, r.ty, r.entry_start, r.entry_end, r.output
             );
+            for e in &tiled.entries[r.entry_start as usize..r.entry_end as usize] {
+                let l = scene.lines[(e.line & !LINE_LEFT_EDGE) as usize];
+                let ox = r.tx as f32 * TILE as f32;
+                let oy = r.ty as f32 * TILE as f32;
+                println!(
+                    "    entry: line {} local ({:.3}, {:.3}) -> ({:.3}, {:.3}) left_edge {} backdrop {} out {:#x}",
+                    e.line & !LINE_LEFT_EDGE,
+                    l[0] - ox, l[1] - oy, l[2] - ox, l[3] - oy,
+                    e.line & LINE_LEFT_EDGE != 0,
+                    e.backdrop,
+                    e.out
+                );
+            }
             let t = TILE as usize;
             for y in 0..t {
                 let row: Vec<String> = (0..t)

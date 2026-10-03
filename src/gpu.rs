@@ -12,6 +12,8 @@ pub enum Mode {
     TwoLines,
     /// Self-contained stripped-down shader (one line per thread, sparse, chunk 1).
     Simple,
+    /// 8x8 entries expanded to 4x4 quadrant items with load balancing (TILE must be 8).
+    Quadrant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -21,13 +23,35 @@ pub struct Variant {
     pub profile: u32,
     /// Evaluate every cell with the full area formula (no coset classification / FIFO).
     pub dense: bool,
+    /// Quadrant mode: item slots per thread (3 => entries per workgroup = threads,
+    /// 2 => entries = threads / 2).
+    pub quad_slots: u32,
     pub wg_size: u32,
     pub chunk: u32,
 }
 
 impl Variant {
+    /// Entries per piece before a new output slot is needed (the quadrant variant only
+    /// splits at workgroup boundaries).
+    pub fn piece_size(&self) -> usize {
+        if self.mode == Mode::Quadrant { usize::MAX } else { crate::tiler::PIECE }
+    }
+
+    /// Pixel (x, y) -> index within a run's output tile.
+    pub fn layout_index(&self, x: u32, y: u32) -> usize {
+        if self.mode == Mode::Quadrant {
+            crate::reference::quadrant_major_index(x, y)
+        } else {
+            crate::reference::coset_major_index(x, y)
+        }
+    }
+
     pub fn entries_per_wg(&self) -> usize {
-        (self.wg_size as usize) * if self.mode == Mode::TwoLines { 2 } else { 1 }
+        match self.mode {
+            Mode::TwoLines => self.wg_size as usize * 2,
+            Mode::Quadrant => if self.quad_slots == 2 { self.wg_size as usize / 2 } else { self.wg_size as usize },
+            _ => self.wg_size as usize,
+        }
     }
 
     pub fn name(&self) -> String {
@@ -36,10 +60,14 @@ impl Variant {
             Mode::OneLine => "oneline",
             Mode::TwoLines => "twoline",
             Mode::Simple => "simple",
+            Mode::Quadrant => "quadrant",
         };
         let dense = if self.dense { "_dense" } else { "" };
+        if self.mode == Mode::Quadrant {
+            return format!("{mode}_wg{}_e{}", self.wg_size, self.entries_per_wg());
+        }
         if self.mode == Mode::Simple {
-            return format!("simple_wg{}", self.wg_size);
+            return format!("{mode}_wg{}", self.wg_size);
         }
         if self.mode == Mode::ComputeOnly {
             format!("{mode}{}_wg{}_chunk{}{dense}", self.profile, self.wg_size, self.chunk)
@@ -53,19 +81,26 @@ impl Variant {
             "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\nconst DENSE: u32 = {}u;\n",
             TILE, self.wg_size, self.chunk, self.profile, self.dense as u32
         );
-        if self.mode == Mode::Simple {
+        if self.mode == Mode::Simple || self.mode == Mode::Quadrant {
+            let body = if self.mode == Mode::Simple {
+                include_str!("../shader/merge_simple.wgsl")
+            } else {
+                include_str!("../shader/merge_quadrant.wgsl")
+            };
+            let qprofile: u32 = std::env::var("QPROFILE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             return format!(
-                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\n{}",
+                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst ENTRIES: u32 = {}u;\nconst QPROFILE: u32 = {}u;\n{body}",
                 TILE,
                 self.wg_size,
-                include_str!("../shader/merge_simple.wgsl")
+                self.entries_per_wg(),
+                qprofile
             );
         }
         let body = match self.mode {
             Mode::ComputeOnly => include_str!("../shader/merge0.wgsl"),
             Mode::OneLine => include_str!("../shader/merge1.wgsl"),
             Mode::TwoLines => include_str!("../shader/merge2.wgsl"),
-            Mode::Simple => unreachable!(),
+            Mode::Simple | Mode::Quadrant => unreachable!(),
         };
         format!("{header}{}\n{body}", include_str!("../shader/phase2.wgsl"))
     }

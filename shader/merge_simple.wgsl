@@ -111,6 +111,7 @@ fn main(
         ye = d / b;
         ye_sign = sign(delta.x);
     }
+    let a2 = 2.0 * a;
 
     var pack = 0u;
     for (var c = 0u; c < 4u; c++) {
@@ -120,13 +121,18 @@ fn main(
         // Classify the N_POS cells: hit if the infinite line passes through the cell.
         var hits = 0u;
         var sides = 0u;
+        var bit = 1u;
         for (var r = 0u; r < HALF; r++) {
-            let t_y = b * (f32(2u * r + cy0) + 0.5) - d;
+            var s = b * (f32(2u * r + cy0) + 0.5) - d + a * (f32(cx0) + 0.5);
             for (var k = 0u; k < HALF; k++) {
-                let s = fma(a, f32(2u * k + cx0) + 0.5, t_y);
-                let pos = r * HALF + k;
-                hits |= u32(abs(s) < h) << pos;
-                sides |= u32((s > 0.0) == a_pos) << pos;
+                if (abs(s) < h) {
+                    hits |= bit;
+                }
+                if ((s > 0.0) == a_pos) {
+                    sides |= bit;
+                }
+                bit <<= 1;
+                s += a2;
             }
         }
 

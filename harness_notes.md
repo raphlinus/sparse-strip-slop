@@ -220,6 +220,44 @@ modular version and to be read. Same scene, 16x replicated, median ms:
 Identical within noise: the sparse scheme's cost is in its structure, not in how the
 modular code compiled.
 
+## Quadrant variant (`shader/merge_quadrant.wgsl`, `Mode::Quadrant`, 8x8 only)
+
+8x8 entries in, merged as 4x4 quadrants with explicit load balancing. Each thread holds
+one entry, computes the quadrants its line touches (the 4x4 tiler's rule inside the
+tile) and the quadrant backdrop deltas relative to the tile's top-left corner: top-edge
+crossings at x in [0,4) feed NE, tile left-edge crossings with y_edge <= 4 feed SW and
+SE, midline crossings at x in [0,4) feed SE. Counts are packed 8 bits per quadrant and
+exclusively scanned; items are quadrant-major so a run's items in one quadrant are
+contiguous; each item finds its entry by binary search and its group head directly from
+the scan at the run head. Up to 3 items per thread, dense 4x4 evaluation, two barriers
+per cell; heads atomicExchange their slot to zero and resolve with backdrop + delta; run
+heads write untouched quadrants as uniform values. Pieces split only at workgroup
+boundaries. Output layout quadrant-major: q * 16 + ly * 4 + lx.
+
+Items on the tiger: 85733, matching the 4x4 tiler's 85734 entries.
+
+Two exactness lessons, both already present in the tiler: decisions at x = 0 must be
+derived from the tiler's left-edge flag rather than recomputed (a line through the tile
+corner computed to x = -1e-6 and lost its NE delta), and x on the line must be taken from
+the endpoint when the clip y equals an endpoint y (a vertex at exactly x = 4.000
+interpolated to 3.99999 and gained a spurious left-edge term).
+
+Same scene, 16x replicated, median ms (correct within 1 LSB on all but 38 runs):
+
+| configuration                         | total | setup only |
+|---------------------------------------|-------|------------|
+| quadrant, 256 entries, 3 slots/thread | 0.498 | 0.252      |
+| quadrant, 128 entries, 2 slots/thread | 0.593 | 0.298      |
+| dense 8x8 one line ch1 (reference)    | 0.521 |            |
+| dense 4x4 one line ch1 (same items)   | 0.289 |            |
+
+The cell loop itself costs about 0.25 ms, in line with the plain 4x4 merge, so the per-item
+work is as efficient as hoped. The setup (two 8-round scans, geometry, delta atomics,
+three binary searches and geometry rebuilds per thread, uniform-quadrant writes) costs as
+much again and erases the gain. Candidates: scatter (entry, quadrant) into a shared item
+table instead of binary searching, run both scans in one loop sharing barriers, cache the
+tile-local line in shared memory, subgroup scans.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and
