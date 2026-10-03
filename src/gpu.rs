@@ -91,11 +91,13 @@ impl Variant {
             TILE, self.wg_size, self.chunk, self.profile, self.dense as u32
         );
         if self.mode == Mode::Msaa {
+            let mprof: u32 = std::env::var("MPROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             return format!(
-                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\n{}",
+                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\nconst MPROF: u32 = {}u;\n{}",
                 TILE,
                 self.wg_size,
                 self.cell_mode,
+                mprof,
                 include_str!("../shader/msaa1.wgsl")
             );
         }
@@ -212,7 +214,7 @@ impl Gpu {
         // Area: 1 byte per pixel, 4 bytes per partial sample. MSAA: 2 bytes per pixel
         // (16-bit mask), 16 x 4 bytes per partial pixel.
         let (alpha_size, partials_size) = if variant.mode == Mode::Msaa {
-            ((n_alpha.max(1) as u64) * PIXELS as u64 * 2, (n_partials.max(1) as u64) * PIXELS as u64 * 64)
+            ((n_alpha.max(1) as u64) * PIXELS as u64 * 2, (n_partials.max(1) as u64) * PIXELS as u64 * 16)
         } else {
             ((n_alpha.max(1) as u64) * PIXELS as u64, (n_partials.max(1) as u64) * PIXELS as u64 * 4)
         };

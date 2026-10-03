@@ -597,9 +597,16 @@ fn msaa_main() {
                             let ci = variant.layout_index(x, y);
                             let mut w = [0i32; 16];
                             for p in first..first + count {
-                                let base = (p as usize * PIXELS + ci) * 16;
+                                let base = (p as usize * PIXELS + ci) * 4;
+                                let w0 = result.partials[base] as u32;
+                                let w1 = result.partials[base + 1] as u32;
+                                let own = result.partials[base + 2] as u32;
+                                let bd = result.partials[base + 3];
                                 for sidx in 0..16 {
-                                    w[sidx] += result.partials[base + sidx];
+                                    let word = if sidx < 8 { w0 } else { w1 };
+                                    let lane = ((word >> (4 * (sidx & 7))) & 0xf) as i32 - 8;
+                                    let o = ((own >> sidx) & 1) as i32 - ((own >> (16 + sidx)) & 1) as i32;
+                                    w[sidx] += lane + o + bd;
                                 }
                             }
                             m[(y * TILE + x) as usize] = msaa::resolve_mask(&w, eo);

@@ -258,6 +258,40 @@ much again and erases the gain. Candidates: scatter (entry, quadrant) into a sha
 table instead of binary searching, run both scans in one loop sharing barriers, cache the
 tile-local line in shared memory, subgroup scans.
 
+## MSAA 16 (`src/msaa.rs`, `shader/msaa1.wgsl`, run with `MSAA=1`)
+
+Payload per (line, pixel): 16-bit mask of samples right of the line within the segment's
+y-range (sign by direction) plus the y_edge term, so each sample gets {-1, 0, +1}. Samples
+follow the D3D11 16x pattern as in Vello (sorted by y, so y-range tests are contiguous bit
+ranges). Half-plane masks come from Vello's `mask_lut_16` (64 translations x 32 slopes per
+sign, 8 KB), with fill_path_ms's walk parameters evaluated directly per cell via
+`sub_ix = (y - y0i) + x_sign * (x - x0i)`. Accumulation: two slot words per pixel with
+4-bit lanes biased at 8; adders atomicAdd the signed packed payload as an integer (lanes
+stay in [1, 15] for up to 7 adders, so the multi-digit sum is exact); the head keeps its own
+payload in registers and adds it at resolve, hence pieces of head + 7. Output: 16-bit mask
+per pixel, two per u32, coset-major; partial pieces write 16 i32 per pixel.
+
+Correctness: the CPU reference matches the exact f64 sample-point oracle on 99.7% of
+pixels and 99.98% of samples (LUT quantization, max 4 samples off in a pixel). GPU
+inline-LUT and FIFO modes match the CPU reference bit for bit; the direct 16-compare
+mode matches the oracle instead. Rounding: WGSL round() is half-to-even, mirrored with
+`round_ties_even` on the CPU.
+
+Timing, 1600x1600 tiger, 16x replicated (823K entries), one line per thread, chunk 1:
+
+| cell mode                       | first | SWAR resolve |
+|---------------------------------|-------|--------------|
+| inline LUT (classify per cell)  | 3.65  | 1.78         |
+| coset FIFO of LUT masks         | 3.81  | 1.96         |
+| direct 16 samples (no LUT)      | 6.03  | 4.15         |
+| dense area version, same scene  | 0.52  |              |
+
+Ablation (inline LUT, before SWAR): payload compute only 0.60 ms, + merge 0.79, + resolve
+3.65. The head's 16-iteration resolve loop was 78% of the time; replacing it with a SWAR
+resolve (expected lane words from backdrop and own payload, xor, or-reduce within
+nibbles, compress) halved the total. The LUT beats direct evaluation by 1.65x-2.3x. The
+FIFO's fixed-trip precompute is slightly slower than classifying and looking up inline.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and

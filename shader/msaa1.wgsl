@@ -59,6 +59,15 @@ fn range_mask(lo: f32, hi: f32) -> u32 {
     return m & 0xffffu;
 }
 
+// Compress the low bit of each nibble into 8 contiguous bits (inverse of spread8).
+fn compress8(v: u32) -> u32 {
+    var x = v & 0x11111111u;
+    x = (x | (x >> 3u)) & 0x03030303u;
+    x = (x | (x >> 6u)) & 0x000F000Fu;
+    x = (x | (x >> 12u)) & 0xffu;
+    return x;
+}
+
 // Spread 8 mask bits into the low bit of each nibble.
 fn spread8(b: u32) -> u32 {
     var x = (b | (b << 12u)) & 0x000F000Fu;
@@ -258,6 +267,7 @@ fn main(
 
     let s = setup(e);
     var pack = 0u;
+    var acc = 0u;
     for (var c = 0u; c < 4u; c++) {
         let cx0 = c >> 1u;
         let cy0 = c & 1u;
@@ -323,6 +333,11 @@ fn main(
             let lo = spread8(pm.x & 0xffu) - spread8(pm.y & 0xffu);
             let hi = spread8(pm.x >> 8u) - spread8(pm.y >> 8u);
 
+            if MPROF == 2u {
+                // Payload compute only.
+                acc ^= lo ^ hi;
+                continue;
+            }
             if is_head {
                 atomicStore(&sh_slot[2u * t], 0x88888888u);
                 atomicStore(&sh_slot[2u * t + 1u], 0x88888888u);
@@ -338,16 +353,72 @@ fn main(
                 let w1 = atomicLoad(&sh_slot[2u * t + 1u]);
                 let cell = c * N_POS + pos;
                 var mask = 0u;
-                for (var i = 0u; i < 16u; i++) {
-                    let word = select(w1, w0, i < 8u);
-                    let lane = i32((word >> (4u * (i & 7u))) & 0xfu) - 8;
-                    let own = i32((pm.x >> i) & 1u) - i32((pm.y >> i) & 1u);
-                    let w = lane + own + backdrop;
-                    if is_partial {
-                        partials_out[(out_ix * PIXELS + cell) * 16u + i] = w;
+                if MPROF == 1u {
+                    // Merge but no resolve: write the raw lane words' xor.
+                    pack |= ((w0 ^ w1) & 0xffffu) << (16u * (cell & 1u));
+                    if (cell & 1u) == 1u {
+                        mask_out[out_ix * (PIXELS / 2u) + (cell >> 1u)] = pack;
+                        pack = 0u;
                     }
-                    let covered = select(w != 0, (w & 1) != 0, even_odd);
-                    mask |= u32(covered) << i;
+                    continue;
+                }
+                if is_partial {
+                    // Compact partial record: lane words, own payload, backdrop. The CPU
+                    // decodes per sample and folds pieces.
+                    let base_ix = (out_ix * PIXELS + cell) * 4u;
+                    partials_out[base_ix] = i32(w0);
+                    partials_out[base_ix + 1u] = i32(w1);
+                    partials_out[base_ix + 2u] = i32(pm.x | (pm.y << 16u));
+                    partials_out[base_ix + 3u] = backdrop;
+                } else {
+                    // SWAR resolve. Sample s has winding lane - 8 + own + backdrop; it is
+                    // covered (nonzero) iff lane != base - own with base = 8 - backdrop.
+                    // Lanes are in [1, 15]; expected values outside that range never match,
+                    // which the saturating cases below encode with e = 0 or a forced bit.
+                    let r = 0x11111111u;
+                    let plus_lo = spread8(pm.x & 0xffu);
+                    let plus_hi = spread8(pm.x >> 8u);
+                    let minus_lo = spread8(pm.y & 0xffu);
+                    let minus_hi = spread8(pm.y >> 8u);
+                    var x0: u32;
+                    var x1: u32;
+                    if even_odd {
+                        // Parity of lane + own + backdrop.
+                        let pb = u32(backdrop & 1) * r;
+                        x0 = (w0 ^ plus_lo ^ minus_lo ^ pb) & r;
+                        x1 = (w1 ^ plus_hi ^ minus_hi ^ pb) & r;
+                    } else {
+                        let base = 8 - backdrop;
+                        var e0: u32;
+                        var e1: u32;
+                        var force0 = 0u;
+                        var force1 = 0u;
+                        if base >= 1 && base <= 14 {
+                            e0 = u32(base) * r - lo;
+                            e1 = u32(base) * r - hi;
+                        } else if base == 15 {
+                            e0 = 15u * r - plus_lo;
+                            e1 = 15u * r - plus_hi;
+                            force0 = minus_lo;
+                            force1 = minus_hi;
+                        } else if base == 16 {
+                            e0 = 15u * plus_lo;
+                            e1 = 15u * plus_hi;
+                        } else if base == 0 {
+                            e0 = minus_lo;
+                            e1 = minus_hi;
+                        } else {
+                            e0 = 0u;
+                            e1 = 0u;
+                        }
+                        x0 = (w0 ^ e0) | force0;
+                        x1 = (w1 ^ e1) | force1;
+                        x0 |= x0 >> 2u;
+                        x0 |= x0 >> 1u;
+                        x1 |= x1 >> 2u;
+                        x1 |= x1 >> 1u;
+                    }
+                    mask = compress8(x0) | (compress8(x1) << 8u);
                 }
                 if !is_partial {
                     pack |= mask << (16u * (cell & 1u));
@@ -358,5 +429,8 @@ fn main(
                 }
             }
         }
+    }
+    if MPROF == 2u && acc == 0x7eadbeefu {
+        mask_out[0] = acc;
     }
 }
