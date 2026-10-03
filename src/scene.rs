@@ -44,9 +44,11 @@ impl Flattener {
         );
         let end = self.scene.lines.len() as u32;
         if end > start {
+            // EVENODD=1 marks every path even-odd (pico_svg has no fill-rule) to exercise
+            // those code paths against the references.
             self.scene.paths.push(PathData {
                 color,
-                even_odd: false,
+                even_odd: std::env::var("EVENODD").is_ok(),
                 line_start: start,
                 line_end: end,
             });

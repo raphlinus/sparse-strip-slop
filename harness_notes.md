@@ -277,20 +277,38 @@ inline-LUT and FIFO modes match the CPU reference bit for bit; the direct 16-com
 mode matches the oracle instead. Rounding: WGSL round() is half-to-even, mirrored with
 `round_ties_even` on the CPU.
 
-Timing, 1600x1600 tiger, 16x replicated (823K entries), one line per thread, chunk 1:
+Resolve: SWAR. Expected lane words from backdrop and own payload (saturating cases for
+backdrops outside [-6, 7]: expected values outside [1, 15] never match, encoded as e = 0 or
+a forced bit), xor against the slot words, or-reduce within nibbles, compress to the
+16-bit mask; even-odd uses lane parity. Partial pieces write (w0, w1, own, backdrop) per
+pixel and the CPU decodes. The first version had a 16-iteration per-sample loop: 78% of
+the time, and even as a rarely taken slow path its presence cost 0.8 ms (register
+pressure), so there is no loop anywhere in the resolve now.
 
-| cell mode                       | first | SWAR resolve |
-|---------------------------------|-------|--------------|
-| inline LUT (classify per cell)  | 3.65  | 1.78         |
-| coset FIFO of LUT masks         | 3.81  | 1.96         |
-| direct 16 samples (no LUT)      | 6.03  | 4.15         |
-| dense area version, same scene  | 0.52  |              |
+Timing, 1600x1600 tiger, 16x replicated, chunk 1, median ms:
 
-Ablation (inline LUT, before SWAR): payload compute only 0.60 ms, + merge 0.79, + resolve
-3.65. The head's 16-iteration resolve loop was 78% of the time; replacing it with a SWAR
-resolve (expected lane words from backdrop and own payload, xor, or-reduce within
-nibbles, compress) halved the total. The LUT beats direct evaluation by 1.65x-2.3x. The
-FIFO's fixed-trip precompute is slightly slower than classifying and looking up inline.
+| variant                              | 8x8 (823K entries) | 4x4 (1.37M entries) |
+|--------------------------------------|--------------------|---------------------|
+| one line, inline LUT                 | 1.04               | 0.52                |
+| one line, coset FIFO of LUT masks    | 1.20               | 0.67                |
+| one line, direct 16 samples          | 3.49               | 1.50                |
+| two lines, inline LUT                | 1.21               | 0.56                |
+| two lines, direct 16 samples         | 3.70               | 1.59                |
+| dense area version, same scene       | 0.52               | 0.23                |
+
+Ablation, 8x8 one line inline LUT (`MPROF` env: 2 = payload compute only, 1 = + merge,
+0 = full): 0.60 / 0.79 / 1.04 ms. Payload compute is now the largest part; merge
+(slots, atomics, barriers) 0.19 as in the area version; resolve 0.25.
+
+Observations:
+- MSAA costs 2.0x the dense area version at 8x8 and 2.3x at 4x4; the first version was 7x.
+- The LUT beats direct 16-sample evaluation by 2.9-3.4x.
+- Classifying each cell and looking the LUT up inline beats the FIFO precompute by 15-28%.
+- Two lines per thread is 8-16% slower than one line here, as for the area version
+  before chunk 1 + packed stores; the per-thread state doubles.
+- 4x4 is 2x faster than 8x8 for the same scene, as for the area version.
+- Even-odd (`EVENODD=1` marks every path even-odd): all area and MSAA variants stay
+  within 1 LSB / bit-exact against their references.
 
 ## Ideas not yet tried
 

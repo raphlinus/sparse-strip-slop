@@ -534,13 +534,16 @@ fn msaa_main() {
         .collect();
     let mut lines_padded = scene.lines.clone();
     lines_padded.push([0.0; 4]);
-    let mut tiled = tiled;
-    if replicate > 1 {
-        tiler::replicate(&mut tiled, replicate, scene.paths.len() as u32);
-    }
-    for cell_mode in 0..3u32 {
+    let msaa_variants = [
+        (Mode::Msaa, 0u32),
+        (Mode::Msaa, 1),
+        (Mode::Msaa, 2),
+        (Mode::Msaa2, 0),
+        (Mode::Msaa2, 2),
+    ];
+    for (mode, cell_mode) in msaa_variants {
         let variant = Variant {
-            mode: Mode::Msaa,
+            mode,
             profile: 0,
             dense: false,
             quad_slots: 3,
@@ -548,6 +551,20 @@ fn msaa_main() {
             wg_size: 256,
             chunk: 1,
         };
+        // Re-tile per variant: entries per workgroup differ, and so do piece boundaries.
+        let mut tiled = tiler::tile(&scene, variant.entries_per_wg(), tiler::PIECE);
+        let ref_masks: Vec<[u16; PIXELS]> = tiled
+            .runs
+            .iter()
+            .map(|r| {
+                let eo = scene.paths[r.path as usize].even_odd;
+                let w = msaa::run_sample_winding(&lut, &scene, &tiled, r);
+                std::array::from_fn(|i| msaa::resolve_mask(&w[i], eo))
+            })
+            .collect();
+        if replicate > 1 {
+            tiler::replicate(&mut tiled, replicate, scene.paths.len() as u32);
+        }
         println!("== {} ==", variant.name());
         let result = gpu.run(
             variant,
@@ -654,12 +671,12 @@ fn msaa_main() {
             }
             for y in 0..TILE as usize {
                 let row: Vec<String> = (0..TILE as usize)
-                    .map(|x| format!("{:04x}/{:04x}", gpu_masks[ri][y * 8 + x], ref_masks[ri][y * 8 + x]))
+                    .map(|x| format!("{:04x}/{:04x}", gpu_masks[ri][y * TILE as usize + x], ref_masks[ri][y * TILE as usize + x]))
                     .collect();
                 println!("    {}", row.join(" "));
             }
         }
-        if cell_mode == 0 {
+        if mode == Mode::Msaa && cell_mode == 0 {
             let alphas: Vec<[u8; PIXELS]> = gpu_masks
                 .iter()
                 .map(|m| std::array::from_fn(|i| msaa::mask_alpha(m[i])))

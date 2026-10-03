@@ -16,6 +16,8 @@ pub enum Mode {
     Quadrant,
     /// MSAA 16 payload, one entry per thread, chunk 1; `cell_mode` selects the per-cell method.
     Msaa,
+    /// MSAA 16 payload, two entries per thread (case table).
+    Msaa2,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,7 +54,7 @@ impl Variant {
 
     pub fn entries_per_wg(&self) -> usize {
         match self.mode {
-            Mode::TwoLines => self.wg_size as usize * 2,
+            Mode::TwoLines | Mode::Msaa2 => self.wg_size as usize * 2,
             Mode::Quadrant => if self.quad_slots == 2 { self.wg_size as usize / 2 } else { self.wg_size as usize },
             _ => self.wg_size as usize,
         }
@@ -66,12 +68,13 @@ impl Variant {
             Mode::Simple => "simple",
             Mode::Quadrant => "quadrant",
             Mode::Msaa => "msaa",
+            Mode::Msaa2 => "msaa2",
         };
         let dense = if self.dense { "_dense" } else { "" };
         if self.mode == Mode::Quadrant {
             return format!("{mode}_wg{}_e{}", self.wg_size, self.entries_per_wg());
         }
-        if self.mode == Mode::Msaa {
+        if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 {
             let cm = ["inlinelut", "fifolut", "direct"][self.cell_mode as usize];
             return format!("{mode}_{cm}_wg{}", self.wg_size);
         }
@@ -90,15 +93,20 @@ impl Variant {
             "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\nconst DENSE: u32 = {}u;\n",
             TILE, self.wg_size, self.chunk, self.profile, self.dense as u32
         );
-        if self.mode == Mode::Msaa {
+        if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 {
             let mprof: u32 = std::env::var("MPROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let body = if self.mode == Mode::Msaa {
+                include_str!("../shader/msaa1.wgsl")
+            } else {
+                include_str!("../shader/msaa2.wgsl")
+            };
             return format!(
-                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\nconst MPROF: u32 = {}u;\n{}",
+                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\nconst MPROF: u32 = {}u;\n{}\n{body}",
                 TILE,
                 self.wg_size,
                 self.cell_mode,
                 mprof,
-                include_str!("../shader/msaa1.wgsl")
+                include_str!("../shader/msaa_common.wgsl")
             );
         }
         if self.mode == Mode::Simple || self.mode == Mode::Quadrant {
@@ -120,7 +128,7 @@ impl Variant {
             Mode::ComputeOnly => include_str!("../shader/merge0.wgsl"),
             Mode::OneLine => include_str!("../shader/merge1.wgsl"),
             Mode::TwoLines => include_str!("../shader/merge2.wgsl"),
-            Mode::Simple | Mode::Quadrant | Mode::Msaa => unreachable!(),
+            Mode::Simple | Mode::Quadrant | Mode::Msaa | Mode::Msaa2 => unreachable!(),
         };
         format!("{header}{}\n{body}", include_str!("../shader/phase2.wgsl"))
     }
@@ -213,7 +221,7 @@ impl Gpu {
         });
         // Area: 1 byte per pixel, 4 bytes per partial sample. MSAA: 2 bytes per pixel
         // (16-bit mask), 16 x 4 bytes per partial pixel.
-        let (alpha_size, partials_size) = if variant.mode == Mode::Msaa {
+        let (alpha_size, partials_size) = if variant.mode == Mode::Msaa || variant.mode == Mode::Msaa2 {
             ((n_alpha.max(1) as u64) * PIXELS as u64 * 2, (n_partials.max(1) as u64) * PIXELS as u64 * 16)
         } else {
             ((n_alpha.max(1) as u64) * PIXELS as u64, (n_partials.max(1) as u64) * PIXELS as u64 * 4)
