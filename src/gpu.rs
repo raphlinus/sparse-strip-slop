@@ -185,9 +185,12 @@ impl Gpu {
         if adapter.features().contains(wgpu::Features::SUBGROUP) {
             features |= wgpu::Features::SUBGROUP;
         }
+        // Adapter limits (the defaults cap workgroups at 256 invocations and 16 KB).
+        let required_limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("merge harness"),
             required_features: features,
+            required_limits,
             ..Default::default()
         }))
         .expect("no device");

@@ -484,6 +484,22 @@ this GPU; even the leanest form is 26% slower. The merge's atomics were already 
 (the whole merge phase is 0.19 ms), so there was little to win and the SIMD-wide ops are
 not free. Barrier count was unchanged in all versions.
 
+## Workgroup size sweep, one-line MSAA (always-gather LUT), `WGSWEEP=1`
+
+16x replicated, median ms (device created with the adapter's limits; wgpu's defaults cap
+workgroups at 256 invocations):
+
+| wg   | 8x8   | 4x4   |
+|------|-------|-------|
+| 64   | 1.027 | 0.498 |
+| 128  | 1.035 | 0.498 |
+| 256  | 1.026 | 0.508 |
+| 512  | 1.117 | 0.549 |
+| 1024 | 1.328 | 0.621 |
+
+Flat from 64 to 256, then worse: +9% at 512, +30% at 1024, where the 128-barrier-pair
+cell loop synchronizes more threads per barrier and occupancy per core drops.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and

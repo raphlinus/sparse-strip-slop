@@ -894,20 +894,24 @@ fn msaa_main() {
         .collect();
     let mut lines_padded = scene.lines.clone();
     lines_padded.push([0.0; 4]);
-    let msaa_variants = [
-        (Mode::Msaa, 0u32),
-        (Mode::MsaaQuadrant, 0),
-        (Mode::MsaaFlat, 0),
-        (Mode::MsaaFlat, 3),
-    ];
-    for (mode, cell_mode) in msaa_variants {
+    let msaa_variants: Vec<(Mode, u32, u32)> = if std::env::var("WGSWEEP").is_ok() {
+        [64u32, 128, 256, 512, 1024].iter().map(|&w| (Mode::Msaa, 3u32, w)).collect()
+    } else {
+        vec![
+            (Mode::Msaa, 0u32, 256u32),
+            (Mode::MsaaQuadrant, 0, 256),
+            (Mode::MsaaFlat, 0, 256),
+            (Mode::MsaaFlat, 3, 256),
+        ]
+    };
+    for (mode, cell_mode, wg_size) in msaa_variants {
         let variant = Variant {
             mode,
             profile: 0,
             dense: false,
             quad_slots: 3,
             cell_mode,
-            wg_size: 256,
+            wg_size,
             chunk: 1,
         };
         // Re-tile per variant: entries per workgroup differ, and so do piece boundaries.
@@ -1093,7 +1097,7 @@ fn msaa_main() {
     }
 
     // GPU expansion pipeline: 8x8 entries -> 4x4 quadrant entries -> merge.
-    if TILE == 8 {
+    if TILE == 8 && std::env::var("WGSWEEP").is_err() {
         for cell_mode in [0u32, 3] {
             let wg = 256usize;
             let mut tiled = tiler::tile(&scene, wg, usize::MAX);
