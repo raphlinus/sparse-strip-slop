@@ -11,7 +11,7 @@ use composite::{Image, color_f32};
 use gpu::{Gpu, Mode, Variant};
 use reference::{FIXED_ONE, PathTruth, classify_hits, quadrants_touched, resolve, run_winding};
 use scene::Scene;
-use tiler::{LINE_LEFT_EDGE, PIXELS, RunOutput, TILE, Tiled};
+use tiler::{LINE_LEFT_EDGE, PIXELS, Run, RunOutput, TILE, Tiled};
 
 /// Resolved alpha per run, row-major within the tile.
 type RunAlphas = Vec<[u8; PIXELS]>;
@@ -413,6 +413,116 @@ fn main() {
     }
 }
 
+/// Per workgroup segment of a run: item counts per quadrant (mirrors the shader).
+fn segment_qcounts(scene: &Scene, tiled: &Tiled, start: usize, end: usize) -> [u32; 4] {
+    let mut cnt = [0u32; 4];
+    for e in &tiled.entries[start..end] {
+        let line = &scene.lines[(e.line & !LINE_LEFT_EDGE) as usize];
+        let m = quadrants_touched(line, e.key & 0x3ff, (e.key >> 10) & 0x3ff);
+        for q in 0..4 {
+            cnt[q] += (m >> q) & 1;
+        }
+    }
+    cnt
+}
+
+/// Records of a segment: sum over quadrants of max(1, ceil(count / 8)).
+fn segment_records(cnt: &[u32; 4]) -> u32 {
+    cnt.iter().map(|&c| c.div_ceil(8).max(1)).sum()
+}
+
+/// Output allocation for the MSAA quadrant variant: a run is resolved in place only if it
+/// lies in one workgroup and every (run, quadrant) group has at most 8 items; otherwise
+/// each workgroup segment gets `segment_records` partial records.
+fn allocate_quadrant_msaa(scene: &Scene, tiled: &mut Tiled, entries_per_wg: usize) {
+    let mut n_alpha = 0u32;
+    let mut n_partials = 0u32;
+    let n_runs = tiled.runs.len();
+    for ri in 0..n_runs {
+        let (start, end) = (tiled.runs[ri].entry_start as usize, tiled.runs[ri].entry_end as usize);
+        let mut seg_starts = vec![start];
+        let mut k = start + 1;
+        while k < end {
+            if k % entries_per_wg == 0 {
+                seg_starts.push(k);
+            }
+            k += 1;
+        }
+        let one_segment = seg_starts.len() == 1;
+        let cnt0 = segment_qcounts(scene, tiled, start, end);
+        for e in &mut tiled.entries[start..end] {
+            e.out = 0;
+        }
+        if one_segment && cnt0.iter().all(|&c| c <= 8) {
+            tiled.entries[start].out = n_alpha;
+            tiled.runs[ri].output = RunOutput::Alpha(n_alpha);
+            n_alpha += 1;
+        } else {
+            let first = n_partials;
+            for (si, &ss) in seg_starts.iter().enumerate() {
+                let se = seg_starts.get(si + 1).copied().unwrap_or(end);
+                let cnt = segment_qcounts(scene, tiled, ss, se);
+                tiled.entries[ss].out = tiler::OUT_PARTIAL | n_partials;
+                n_partials += segment_records(&cnt);
+            }
+            tiled.runs[ri].output = RunOutput::Partials { first, count: n_partials - first };
+        }
+    }
+    // Padding entries write to a dummy alpha slot.
+    let real_end = tiled.runs.last().map_or(0, |r| r.entry_end as usize);
+    for e in &mut tiled.entries[real_end..] {
+        e.out = n_alpha;
+    }
+    tiled.n_alpha = n_alpha + 1;
+    tiled.n_partials = n_partials;
+}
+
+/// Fold the quadrant variant's partial records of a run into per-sample windings.
+fn fold_quadrant_partials(
+    scene: &Scene,
+    tiled: &Tiled,
+    run: &Run,
+    first: u32,
+    partials: &[i32],
+    entries_per_wg: usize,
+) -> Vec<[i32; 16]> {
+    let mut w = vec![[0i32; 16]; PIXELS];
+    let (start, end) = (run.entry_start as usize, run.entry_end as usize);
+    let mut rec = first as usize;
+    let mut ss = start;
+    while ss < end {
+        let mut se = ss + 1;
+        while se < end && se % entries_per_wg != 0 {
+            se += 1;
+        }
+        let cnt = segment_qcounts(scene, tiled, ss, se);
+        for q in 0..4u32 {
+            let pieces = cnt[q as usize].div_ceil(8).max(1) as usize;
+            for _ in 0..pieces {
+                for p in 0..16u32 {
+                    let base = (rec * 16 + p as usize) * 4;
+                    let w0 = partials[base] as u32;
+                    let w1 = partials[base + 1] as u32;
+                    let own = partials[base + 2] as u32;
+                    let bd = partials[base + 3];
+                    let x = 4 * (q & 1) + (p & 3);
+                    let y = 4 * (q >> 1) + (p >> 2);
+                    let pix = (y * TILE + x) as usize;
+                    for sidx in 0..16 {
+                        let word = if sidx < 8 { w0 } else { w1 };
+                        let lane = ((word >> (4 * (sidx & 7))) & 0xf) as i32 - 8;
+                        let o = ((own >> sidx) & 1) as i32 - ((own >> (16 + sidx)) & 1) as i32;
+                        w[pix][sidx] += lane + o + bd;
+                    }
+                }
+                rec += 1;
+            }
+        }
+        ss = se;
+    }
+    w
+}
+
 /// MSAA 16 path: CPU reference against the sample-point oracle, then GPU variants.
 fn msaa_main() {
     let args: Vec<String> = std::env::args().collect();
@@ -537,8 +647,8 @@ fn msaa_main() {
     let msaa_variants = [
         (Mode::Msaa, 0u32),
         (Mode::Msaa, 3),
-        (Mode::Msaa, 1),
-        (Mode::Msaa, 2),
+        (Mode::MsaaQuadrant, 0),
+        (Mode::MsaaQuadrant, 3),
         (Mode::Msaa2, 0),
     ];
     for (mode, cell_mode) in msaa_variants {
@@ -552,7 +662,13 @@ fn msaa_main() {
             chunk: 1,
         };
         // Re-tile per variant: entries per workgroup differ, and so do piece boundaries.
-        let mut tiled = tiler::tile(&scene, variant.entries_per_wg(), tiler::PIECE);
+        let mut tiled = tiler::tile(&scene, variant.entries_per_wg(), variant.piece_size());
+        if mode == Mode::MsaaQuadrant {
+            if TILE != 8 {
+                continue;
+            }
+            allocate_quadrant_msaa(&scene, &mut tiled, variant.entries_per_wg());
+        }
         let ref_masks: Vec<[u16; PIXELS]> = tiled
             .runs
             .iter()
@@ -606,6 +722,12 @@ fn msaa_main() {
                             let ci = variant.layout_index(x, y);
                             m[(y * TILE + x) as usize] = (words[ci / 2] >> (16 * (ci % 2))) as u16;
                         }
+                    }
+                }
+                RunOutput::Partials { first, .. } if mode == Mode::MsaaQuadrant => {
+                    let w = fold_quadrant_partials(&scene, &tiled, r, first, &result.partials, variant.entries_per_wg());
+                    for i in 0..PIXELS {
+                        m[i] = msaa::resolve_mask(&w[i], eo);
                     }
                 }
                 RunOutput::Partials { first, count } => {

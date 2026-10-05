@@ -18,6 +18,8 @@ pub enum Mode {
     Msaa,
     /// MSAA 16 payload, two entries per thread (case table).
     Msaa2,
+    /// MSAA 16 payload, 8x8 entries merged as load-balanced 4x4 quadrants.
+    MsaaQuadrant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,12 +42,12 @@ impl Variant {
     /// Entries per piece before a new output slot is needed (the quadrant variant only
     /// splits at workgroup boundaries).
     pub fn piece_size(&self) -> usize {
-        if self.mode == Mode::Quadrant { usize::MAX } else { crate::tiler::PIECE }
+        if matches!(self.mode, Mode::Quadrant | Mode::MsaaQuadrant) { usize::MAX } else { crate::tiler::PIECE }
     }
 
     /// Pixel (x, y) -> index within a run's output tile.
     pub fn layout_index(&self, x: u32, y: u32) -> usize {
-        if self.mode == Mode::Quadrant {
+        if matches!(self.mode, Mode::Quadrant | Mode::MsaaQuadrant) {
             crate::reference::quadrant_major_index(x, y)
         } else {
             crate::reference::coset_major_index(x, y)
@@ -69,12 +71,13 @@ impl Variant {
             Mode::Quadrant => "quadrant",
             Mode::Msaa => "msaa",
             Mode::Msaa2 => "msaa2",
+            Mode::MsaaQuadrant => "msaaquad",
         };
         let dense = if self.dense { "_dense" } else { "" };
         if self.mode == Mode::Quadrant {
             return format!("{mode}_wg{}_e{}", self.wg_size, self.entries_per_wg());
         }
-        if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 {
+        if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 || self.mode == Mode::MsaaQuadrant {
             let cm = ["inlinelut", "fifolut", "direct", "alwayslut"][self.cell_mode as usize];
             return format!("{mode}_{cm}_wg{}", self.wg_size);
         }
@@ -93,13 +96,13 @@ impl Variant {
             "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\nconst DENSE: u32 = {}u;\n",
             TILE, self.wg_size, self.chunk, self.profile, self.dense as u32
         );
-        if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 {
+        if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 || self.mode == Mode::MsaaQuadrant {
             let mprof: u32 = std::env::var("MPROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let mabl: u32 = std::env::var("MABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let body = if self.mode == Mode::Msaa {
-                include_str!("../shader/msaa1.wgsl")
-            } else {
-                include_str!("../shader/msaa2.wgsl")
+            let body = match self.mode {
+                Mode::Msaa => include_str!("../shader/msaa1.wgsl"),
+                Mode::Msaa2 => include_str!("../shader/msaa2.wgsl"),
+                _ => include_str!("../shader/msaa_quadrant.wgsl"),
             };
             return format!(
                 "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\nconst MPROF: u32 = {}u;\nconst MABL: u32 = {}u;\n{}\n{body}",
@@ -130,7 +133,7 @@ impl Variant {
             Mode::ComputeOnly => include_str!("../shader/merge0.wgsl"),
             Mode::OneLine => include_str!("../shader/merge1.wgsl"),
             Mode::TwoLines => include_str!("../shader/merge2.wgsl"),
-            Mode::Simple | Mode::Quadrant | Mode::Msaa | Mode::Msaa2 => unreachable!(),
+            Mode::Simple | Mode::Quadrant | Mode::Msaa | Mode::Msaa2 | Mode::MsaaQuadrant => unreachable!(),
         };
         format!("{header}{}\n{body}", include_str!("../shader/phase2.wgsl"))
     }
@@ -223,7 +226,7 @@ impl Gpu {
         });
         // Area: 1 byte per pixel, 4 bytes per partial sample. MSAA: 2 bytes per pixel
         // (16-bit mask), 16 x 4 bytes per partial pixel.
-        let (alpha_size, partials_size) = if variant.mode == Mode::Msaa || variant.mode == Mode::Msaa2 {
+        let (alpha_size, partials_size) = if matches!(variant.mode, Mode::Msaa | Mode::Msaa2 | Mode::MsaaQuadrant) {
             ((n_alpha.max(1) as u64) * PIXELS as u64 * 2, (n_partials.max(1) as u64) * PIXELS as u64 * 16)
         } else {
             ((n_alpha.max(1) as u64) * PIXELS as u64, (n_partials.max(1) as u64) * PIXELS as u64 * 4)

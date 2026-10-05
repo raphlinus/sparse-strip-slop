@@ -336,6 +336,35 @@ Observations:
 - Even-odd (`EVENODD=1` marks every path even-odd): all area and MSAA variants stay
   within 1 LSB / bit-exact against their references.
 
+## MSAA quadrant variant (`shader/msaa_quadrant.wgsl`, `Mode::MsaaQuadrant`)
+
+The quadrant expansion with the MSAA payload. (run, quadrant) groups form pieces of 8
+items (head + 7 adders, as the 4-bit lanes require); a run resolves in place only if it
+lies in one workgroup and every group fits one piece, otherwise each workgroup segment
+writes sum over quadrants of max(1, ceil(count_q / 8)) compact partial records, untouched
+quadrants included. The CPU allocation mirrors the expansion (`allocate_quadrant_msaa`)
+and folds records (`fold_quadrant_partials`). Item count per (run head, quadrant) is
+accumulated in shared memory for the record layout.
+
+Correctness: 35 of 26551 runs differ from the 8x8 reference by 47 single samples, all
+ties where a y_edge or segment-end y lands exactly on a sample row boundary (y = k/16 +
+1/32) and the two decompositions round differently; the 8x8 reference itself resolves
+such ties inconsistently between its crossing and y_edge masks (one spurious sample).
+
+Timing, 16x replicated, inline LUT, median ms:
+
+| variant                       | total | setup only | cell loop |
+|-------------------------------|-------|------------|-----------|
+| MSAA one line 8x8             | 1.040 |            |           |
+| MSAA quadrant 8x8             | 0.986 | 0.343      | 0.64      |
+| MSAA one line 4x4 (same items)| 0.52  |            |           |
+
+Only a 5% win over one-line 8x8. Setup is 0.34 (vs 0.25 for the area quadrant: the MSAA
+Setup struct is ~17 fields and is built three times per thread), and the cell loop is
+0.64 against roughly 0.45 for the 4x4 one-line loop: three items' worth of Setup, RowMasks
+and payload registers per thread. Both halves are register-pressure costs, not barrier or
+atomic costs.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and
