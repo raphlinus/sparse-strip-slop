@@ -48,6 +48,80 @@ const DBIAS: i32 = 512;
 
 var<workgroup> sh_a: array<vec4<u32>, WG_SIZE>;   // (count, nruns, flag, 0)
 var<workgroup> sh_d: array<vec4<i32>, WG_SIZE>;   // segmented deltas
+var<workgroup> sh_sg_a: array<vec4<u32>, 32>;     // per-subgroup aggregates (SGSCAN)
+var<workgroup> sh_sg_d: array<vec4<i32>, 32>;
+
+fn ballot_below(lane: u32) -> vec4<u32> {
+    var m = vec4(0u, 0u, 0u, 0u);
+    for (var w = 0u; w < 4u; w++) {
+        let lo = w * 32u;
+        if lane >= lo + 31u {
+            m[w] = 0xffffffffu;
+        } else if lane >= lo {
+            m[w] = (2u << (lane - lo)) - 1u;
+        }
+    }
+    return m;
+}
+fn ballot_any(b: vec4<u32>) -> bool {
+    return (b.x | b.y | b.z | b.w) != 0u;
+}
+fn ballot_high(b: vec4<u32>) -> u32 {
+    if b.w != 0u { return 96u + firstLeadingBit(b.w); }
+    if b.z != 0u { return 64u + firstLeadingBit(b.z); }
+    if b.y != 0u { return 32u + firstLeadingBit(b.y); }
+    return firstLeadingBit(b.x);
+}
+
+// Workgroup-inclusive segmented scan via subgroups. Returns (count, nruns, flag, 0) and
+// the segmented delta sum, inclusive at this thread; flag = a boundary at or before it.
+struct SegScan {
+    a: vec4<u32>,
+    d: vec4<i32>,
+}
+fn sg_seg_scan(cnt: u32, boundary: bool, d: vec3<i32>, t: u32, lane: u32, sg_size: u32) -> SegScan {
+    let sg = t / sg_size;
+    let incl_cnt = subgroupInclusiveAdd(cnt);
+    let incl_nb = subgroupInclusiveAdd(u32(boundary));
+    let incl_d = subgroupInclusiveAdd(d);
+    let ballot = subgroupBallot(boundary);
+    let bm = ballot & ballot_below(lane);
+    let any_b = ballot_any(bm);
+    let b = select(0u, ballot_high(bm), any_b);
+    // Delta prefix just before the segment start (0 if the segment starts at lane 0).
+    let before = subgroupShuffle(incl_d, max(b, 1u) - 1u);
+    var seg_d = incl_d;
+    if any_b && b > 0u {
+        seg_d = incl_d - before;
+    }
+    let sg_any = ballot_any(ballot);
+    if lane == sg_size - 1u {
+        sh_sg_a[sg] = vec4(incl_cnt, incl_nb, u32(sg_any), 0u);
+        sh_sg_d[sg] = vec4(seg_d, 0);
+    }
+    workgroupBarrier();
+    var cnt_c = 0u;
+    var nb_c = 0u;
+    var flag_c = false;
+    var d_c = vec3(0, 0, 0);
+    var open = true;   // still accumulating the carry (no boundary seen yet, from the right)
+    for (var k = sg; k > 0u; k--) {
+        let sa = sh_sg_a[k - 1u];
+        cnt_c += sa.x;
+        nb_c += sa.y;
+        if open {
+            d_c += sh_sg_d[k - 1u].xyz;
+            if sa.z != 0u {
+                open = false;
+                flag_c = true;
+            }
+        }
+    }
+    var out: SegScan;
+    out.a = vec4(incl_cnt + cnt_c, incl_nb + nb_c, u32(any_b || flag_c), 0u);
+    out.d = vec4(select(seg_d + d_c, seg_d, any_b), 0);
+    return out;
+}
 
 fn x_at(p0: vec2<f32>, p1: vec2<f32>, y: f32) -> f32 {
     if y == p0.y { return p0.x; }
@@ -142,7 +216,8 @@ fn entry_geometry(e: Entry) -> vec4<i32> {
 }
 
 @compute @workgroup_size(WG_SIZE)
-fn e1_map(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+fn e1_map(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>,
+          @builtin(subgroup_size) sg_size: u32, @builtin(subgroup_invocation_id) sg_lane: u32) {
     let t = lid.x;
     let i = wg.x * WG_SIZE + t;
     let e = entries8[i];
@@ -152,23 +227,29 @@ fn e1_map(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) w
     let packed = mask | (u32(g.y + 8) << 4u) | (u32(g.z + 8) << 8u) | (u32(g.w + 8) << 12u) | (u32(boundary) << 16u);
     var a = vec4(countOneBits(mask), u32(boundary), u32(boundary), 0u);
     var dd = vec4(g.y, g.z, g.w, 0);
-    sh_a[t] = a;
-    sh_d[t] = dd;
-    for (var s = 0u; s < firstTrailingBit(WG_SIZE); s++) {
-        workgroupBarrier();
-        var oa = vec4(0u, 0u, 0u, 0u);
-        var od = vec4(0, 0, 0, 0);
-        if t >= (1u << s) {
-            oa = sh_a[t - (1u << s)];
-            od = sh_d[t - (1u << s)];
-        }
-        workgroupBarrier();
-        // Segmented sum: if this element's segment already started (flag), keep; else add.
-        let keep = a.z != 0u;
-        dd = select(dd + od, dd, keep);
-        a = vec4(a.x + oa.x, a.y + oa.y, a.z | oa.z, 0u);
+    if SGSCAN != 0u {
+        let r = sg_seg_scan(a.x, boundary, dd.xyz, t, sg_lane, sg_size);
+        a = r.a;
+        dd = r.d;
+    } else {
         sh_a[t] = a;
         sh_d[t] = dd;
+        for (var s = 0u; s < firstTrailingBit(WG_SIZE); s++) {
+            workgroupBarrier();
+            var oa = vec4(0u, 0u, 0u, 0u);
+            var od = vec4(0, 0, 0, 0);
+            if t >= (1u << s) {
+                oa = sh_a[t - (1u << s)];
+                od = sh_d[t - (1u << s)];
+            }
+            workgroupBarrier();
+            // Segmented sum: if this element's segment already started (flag), keep; else add.
+            let keep = a.z != 0u;
+            dd = select(dd + od, dd, keep);
+            a = vec4(a.x + oa.x, a.y + oa.y, a.z | oa.z, 0u);
+            sh_a[t] = a;
+            sh_d[t] = dd;
+        }
     }
     info[i] = vec4(packed, a.x, a.y, pack_d(dd.xyz));
     if t == WG_SIZE - 1u {
@@ -181,7 +262,8 @@ var<workgroup> sh_carry_a: vec4<i32>;
 var<workgroup> sh_carry_d: vec4<i32>;
 
 @compute @workgroup_size(WG_SIZE)
-fn e2_scan(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn e2_scan(@builtin(local_invocation_id) lid: vec3<u32>,
+           @builtin(subgroup_size) sg_size: u32, @builtin(subgroup_invocation_id) sg_lane: u32) {
     let t = lid.x;
     if t == 0u {
         sh_carry_a = vec4(0, 0, 0, 0);
@@ -198,22 +280,44 @@ fn e2_scan(@builtin(local_invocation_id) lid: vec3<u32>) {
         }
         let my_a = a;
         let my_d = dd;
-        sh_a[t] = vec4<u32>(a);
-        sh_d[t] = dd;
-        for (var s = 0u; s < firstTrailingBit(WG_SIZE); s++) {
-            workgroupBarrier();
-            var oa = vec4(0u, 0u, 0u, 0u);
-            var od = vec4(0, 0, 0, 0);
-            if t >= (1u << s) {
-                oa = sh_a[t - (1u << s)];
-                od = sh_d[t - (1u << s)];
+        if SGSCAN != 0u {
+            // The aggregate's own "boundary" is its has_boundary flag; its count/nruns are
+            // sums. Reuse the segmented scan with cnt = count and a second pass for nruns.
+            let r = sg_seg_scan(u32(a.x), a.z != 0, dd.xyz, t, sg_lane, sg_size);
+            let nb = subgroupInclusiveAdd(u32(a.y));
+            // nruns carry across subgroups: shared table from sg_seg_scan holds counts only,
+            // so accumulate separately.
+            let sg = t / sg_size;
+            if sg_lane == sg_size - 1u {
+                sh_sg_a[sg].w = nb;
             }
             workgroupBarrier();
-            let keep = a.z != 0;
-            dd = select(dd + od, dd, keep);
-            a = vec4(a.x + i32(oa.x), a.y + i32(oa.y), a.z | i32(oa.z), 0);
+            var nb_c = 0u;
+            for (var k = 0u; k < sg; k++) {
+                nb_c += sh_sg_a[k].w;
+            }
+            a = vec4(i32(r.a.x), i32(nb + nb_c), i32(r.a.z), 0);
+            dd = r.d;
             sh_a[t] = vec4<u32>(a);
             sh_d[t] = dd;
+        } else {
+            sh_a[t] = vec4<u32>(a);
+            sh_d[t] = dd;
+            for (var s = 0u; s < firstTrailingBit(WG_SIZE); s++) {
+                workgroupBarrier();
+                var oa = vec4(0u, 0u, 0u, 0u);
+                var od = vec4(0, 0, 0, 0);
+                if t >= (1u << s) {
+                    oa = sh_a[t - (1u << s)];
+                    od = sh_d[t - (1u << s)];
+                }
+                workgroupBarrier();
+                let keep = a.z != 0;
+                dd = select(dd + od, dd, keep);
+                a = vec4(a.x + i32(oa.x), a.y + i32(oa.y), a.z | i32(oa.z), 0);
+                sh_a[t] = vec4<u32>(a);
+                sh_d[t] = dd;
+            }
         }
         workgroupBarrier();
         // Exclusive values: the inclusive value of the previous element, combined with the

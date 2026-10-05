@@ -458,6 +458,12 @@ the subgroup builtins without the `enable subgroups` directive. Result: 0.820 ->
 (3.4%), bit-identical output. As estimated, the scans are a small part of setup; the
 geometry, fetches and per-(run, quadrant) bookkeeping remain.
 
+Expansion pass with subgroup segmented scans (`SGSCAN=1`, `sg_seg_scan` in expand.wgsl:
+subgroupInclusiveAdd for the sums, ballot + shuffle for the segment-start subtraction,
+8-entry shared carry table): map pass 0.119 -> 0.102 ms, aggregate scan 0.042 -> 0.044
+(single workgroup, latency-bound), expansion total 0.673 -> 0.651. Counters and output
+unchanged.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and

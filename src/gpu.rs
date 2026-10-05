@@ -469,8 +469,9 @@ impl Gpu {
         let off_ctr = 21 * n;
         let off_flags = 21 * n + 4;
         let scratch_len = off_flags + path_flags.len().max(1);
+        let sgscan: u32 = std::env::var("SGSCAN").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let header = format!(
-            "const WG_SIZE: u32 = {wg_size}u;\nconst N: u32 = {n}u;\nconst N_WG: u32 = {n_wg}u;\n\
+            "const WG_SIZE: u32 = {wg_size}u;\nconst N: u32 = {n}u;\nconst N_WG: u32 = {n_wg}u;\nconst SGSCAN: u32 = {sgscan}u;\n\
              const OFF_BASE: u32 = {off_base}u;\nconst OFF_CNT: u32 = {off_cnt}u;\nconst OFF_FILL: u32 = {off_fill}u;\n\
              const OFF_DELTA: u32 = {off_delta}u;\nconst OFF_META: u32 = {off_meta}u;\nconst OFF_RINFO: u32 = {off_rinfo}u;\n\
              const OFF_CTR: u32 = {off_ctr}u;\nconst OFF_FLAGS: u32 = {off_flags}u;\n"
