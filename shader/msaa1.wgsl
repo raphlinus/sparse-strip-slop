@@ -71,13 +71,8 @@ fn main(
                 rm = row_masks(s, y);
             }
             var hp: u32;
-            if CELL_MODE == 0u {
-                let cl = classify(s, x, y);
-                if cl.x {
-                    hp = lut_mask(s, x, y);
-                } else {
-                    hp = select(0u, 0xffffu, cl.y);
-                }
+            if CELL_MODE == 0u || CELL_MODE == 3u {
+                hp = cell_hp(s, x, y);
             } else if CELL_MODE == 1u {
                 if ((hits >> pos) & 1u) != 0u {
                     hp = f0;

@@ -75,7 +75,7 @@ impl Variant {
             return format!("{mode}_wg{}_e{}", self.wg_size, self.entries_per_wg());
         }
         if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 {
-            let cm = ["inlinelut", "fifolut", "direct"][self.cell_mode as usize];
+            let cm = ["inlinelut", "fifolut", "direct", "alwayslut"][self.cell_mode as usize];
             return format!("{mode}_{cm}_wg{}", self.wg_size);
         }
         if self.mode == Mode::Simple {

@@ -277,12 +277,17 @@ fn store_pixel(e: Entry, even_odd: bool, cell: u32, w0: u32, w1: u32, pm: vec2<u
     }
 }
 
-// Half-plane mask for one cell without FIFO state (CELL_MODE 0 or 2).
+// Half-plane mask for one cell without FIFO state (CELL_MODE 0, 2 or 3).
 fn cell_hp(s: Setup, x: u32, y: u32) -> u32 {
     if CELL_MODE == 2u {
         return direct_mask(s, x, y);
     }
     let cl = classify(s, x, y);
+    if CELL_MODE == 3u {
+        // Gather for every cell, select afterwards: no divergence, dense gathers.
+        let m = lut_mask(s, x, y);
+        return select(select(0u, 0xffffu, cl.y), m, cl.x);
+    }
     if cl.x {
         return lut_mask(s, x, y);
     }

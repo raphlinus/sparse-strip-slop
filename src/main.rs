@@ -536,10 +536,10 @@ fn msaa_main() {
     lines_padded.push([0.0; 4]);
     let msaa_variants = [
         (Mode::Msaa, 0u32),
+        (Mode::Msaa, 3),
         (Mode::Msaa, 1),
         (Mode::Msaa, 2),
         (Mode::Msaa2, 0),
-        (Mode::Msaa2, 2),
     ];
     for (mode, cell_mode) in msaa_variants {
         let variant = Variant {

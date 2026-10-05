@@ -300,6 +300,13 @@ Ablation, 8x8 one line inline LUT (`MPROF` env: 2 = payload compute only, 1 = + 
 0 = full): 0.60 / 0.79 / 1.04 ms. Payload compute is now the largest part; merge
 (slots, atomics, barriers) 0.19 as in the area version; resolve 0.25.
 
+Branch vs always-gather (`alwayslut`: compute the LUT index and gather for every cell,
+select by classification afterwards; same results, no divergence, 4-8x the gathers):
+8x8 1.044 -> 1.012 ms, 4x4 0.522 -> 0.507. The unconditional gather is slightly faster, so
+the sparse gathers were not buying anything: the 8 KB LUT is cache-resident and the branch
+costs more than the extra loads. The 3x over direct evaluation comes from one FMA plus a
+lookup replacing 16 FMA-and-compares per cell, not from skipping cells.
+
 Observations:
 - MSAA costs 2.0x the dense area version at 8x8 and 2.3x at 4x4; the first version was 7x.
 - The LUT beats direct 16-sample evaluation by 2.9-3.4x.
