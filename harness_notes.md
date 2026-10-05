@@ -464,6 +464,26 @@ subgroupInclusiveAdd for the sums, ballot + shuffle for the segment-start subtra
 (single workgroup, latency-bound), expansion total 0.673 -> 0.651. Counters and output
 unchanged.
 
+## Subgroup reduction instead of shared atomics (one-line MSAA merge, `SGRED=1`)
+
+Per cell, adders' packed lane words are summed within the subgroup by a ballot-segmented
+`subgroupInclusiveAdd`; the piece head reads its total from registers, and only a piece
+continuing from an earlier subgroup ships its partial through a shared atomic (about 4% of
+pieces). Slots hold cross-subgroup contributions only and are read-and-reset with
+atomicExchange. Bit-exact. Timing, 8x8, 16x replicated:
+
+| version                                                   | ms    |
+|-----------------------------------------------------------|-------|
+| shared atomics (2 atomicAdd per cell)                     | 1.054 |
+| subgroup: 2 scans + ballot + 4 shuffles per cell          | 2.241 |
+| segment structure hoisted out of the loop (2 scans + 4 shuffles) | 1.479 |
+| head's exclusive prefix replaces 2 shuffles (2 scans + 2 shuffles) | 1.332 |
+
+Subgroup scans and shuffles cost more per cell than two low-contention shared atomics on
+this GPU; even the leanest form is 26% slower. The merge's atomics were already cheap
+(the whole merge phase is 0.19 ms), so there was little to win and the SIMD-wide ops are
+not free. Barrier count was unchanged in all versions.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and

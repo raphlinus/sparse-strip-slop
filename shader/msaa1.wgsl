@@ -1,14 +1,51 @@
+const BIAS: u32 = 0x88888888u;
 var<workgroup> sh_slot: array<atomic<u32>, 2u * WG_SIZE>;
 var<workgroup> sh_scan: array<u32, WG_SIZE>;
+
+// 128-bit ballot helpers (SGRED).
+fn ballot_below(lane: u32) -> vec4<u32> {
+    var m = vec4(0u, 0u, 0u, 0u);
+    for (var w = 0u; w < 4u; w++) {
+        let lo = w * 32u;
+        if lane >= lo + 31u {
+            m[w] = 0xffffffffu;
+        } else if lane >= lo {
+            m[w] = (2u << (lane - lo)) - 1u;
+        }
+    }
+    return m;
+}
+fn ballot_any(b: vec4<u32>) -> bool {
+    return (b.x | b.y | b.z | b.w) != 0u;
+}
+fn ballot_high(b: vec4<u32>) -> u32 {
+    if b.w != 0u { return 96u + firstLeadingBit(b.w); }
+    if b.z != 0u { return 64u + firstLeadingBit(b.z); }
+    if b.y != 0u { return 32u + firstLeadingBit(b.y); }
+    return firstLeadingBit(b.x);
+}
+fn ballot_low(b: vec4<u32>) -> u32 {
+    if b.x != 0u { return firstTrailingBit(b.x); }
+    if b.y != 0u { return 32u + firstTrailingBit(b.y); }
+    if b.z != 0u { return 64u + firstTrailingBit(b.z); }
+    return 96u + firstTrailingBit(b.w);
+}
 
 @compute @workgroup_size(WG_SIZE)
 fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(subgroup_size) sg_size: u32,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
 ) {
     let t = local_id.x;
     let i0 = wg_id.x * WG_SIZE + t;
     let e = entries[i0];
+    if SGRED != 0u {
+        // Slots hold only cross-subgroup contributions; start at zero.
+        atomicStore(&sh_slot[2u * t], 0u);
+        atomicStore(&sh_slot[2u * t + 1u], 0u);
+    }
     let boundary = t == 0u || entries[i0 - 1u].key != e.key;
     var v = select(0u, t, boundary);
     sh_scan[t] = v;
@@ -29,6 +66,18 @@ fn main(
     let s = setup(e);
     var pack = 0u;
     var acc = 0u;
+    // SGRED: segment structure within the subgroup is fixed for the whole kernel.
+    var sg_b = 0u;        // my segment's start lane
+    var sg_last = 0u;     // my segment's last lane
+    var sg_cont = false;  // I start a continuation segment (piece headed in an earlier subgroup)
+    if SGRED != 0u {
+        let ballot = subgroupBallot(is_head || sg_lane == 0u);
+        let below = ballot_below(sg_lane);
+        sg_b = ballot_high(ballot & below);
+        let above = ballot & ~below;
+        sg_last = select(sg_size - 1u, ballot_low(above) - 1u, ballot_any(above));
+        sg_cont = sg_lane == sg_b && !is_head;
+    }
     for (var c = 0u; c < 4u; c++) {
         let cx0 = c >> 1u;
         let cy0 = c & 1u;
@@ -102,19 +151,50 @@ fn main(
                 acc ^= lo ^ hi;
                 continue;
             }
-            if is_head {
-                atomicStore(&sh_slot[2u * t], 0x88888888u);
-                atomicStore(&sh_slot[2u * t + 1u], 0x88888888u);
+            var w0 = 0u;
+            var w1 = 0u;
+            if SGRED != 0u {
+                // Segmented sum of the adders' payloads within the subgroup (heads add 0).
+                // Segment = lanes sharing a piece head; a piece continuing from an earlier
+                // subgroup starts a segment at lane 0 and ships its sum through the slot.
+                let add_lo = select(lo, 0u, is_head);
+                let add_hi = select(hi, 0u, is_head);
+                let incl_lo = subgroupInclusiveAdd(add_lo);
+                let incl_hi = subgroupInclusiveAdd(add_hi);
+                // The segment start lane (head, or lane 0 of a continuation) consumes the
+                // total: its own exclusive prefix is the value before the segment.
+                let end_lo = subgroupShuffle(incl_lo, sg_last);
+                let end_hi = subgroupShuffle(incl_hi, sg_last);
+                let tot_lo = end_lo - (incl_lo - add_lo);
+                let tot_hi = end_hi - (incl_hi - add_hi);
+                if sg_cont {
+                    // Continuation of a piece headed in an earlier subgroup.
+                    atomicAdd(&sh_slot[2u * head], tot_lo);
+                    atomicAdd(&sh_slot[2u * head + 1u], tot_hi);
+                }
+                workgroupBarrier();
+                if is_head {
+                    w0 = BIAS + tot_lo + atomicExchange(&sh_slot[2u * t], 0u);
+                    w1 = BIAS + tot_hi + atomicExchange(&sh_slot[2u * t + 1u], 0u);
+                }
+                workgroupBarrier();
+            } else {
+                if is_head {
+                    atomicStore(&sh_slot[2u * t], 0x88888888u);
+                    atomicStore(&sh_slot[2u * t + 1u], 0x88888888u);
+                }
+                workgroupBarrier();
+                if !is_head {
+                    atomicAdd(&sh_slot[2u * head], lo);
+                    atomicAdd(&sh_slot[2u * head + 1u], hi);
+                }
+                workgroupBarrier();
+                if is_head {
+                    w0 = atomicLoad(&sh_slot[2u * t]);
+                    w1 = atomicLoad(&sh_slot[2u * t + 1u]);
+                }
             }
-            workgroupBarrier();
-            if !is_head {
-                atomicAdd(&sh_slot[2u * head], lo);
-                atomicAdd(&sh_slot[2u * head + 1u], hi);
-            }
-            workgroupBarrier();
             if is_head {
-                let w0 = atomicLoad(&sh_slot[2u * t]);
-                let w1 = atomicLoad(&sh_slot[2u * t + 1u]);
                 let cell = c * N_POS + pos;
                 if MPROF == 1u {
                     pack |= ((w0 ^ w1) & 0xffffu) << (16u * (cell & 1u));

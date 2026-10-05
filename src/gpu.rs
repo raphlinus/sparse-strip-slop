@@ -107,6 +107,7 @@ impl Variant {
             let mprof: u32 = std::env::var("MPROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let mabl: u32 = std::env::var("MABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let sgscan: u32 = std::env::var("SGSCAN").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let sgred: u32 = std::env::var("SGRED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             // naga (wgpu 30) exposes subgroup builtins without the `enable` directive.
             let enable = "";
             let qsetup = include_str!("../shader/msaa_quadrant_setup.wgsl");
@@ -117,13 +118,14 @@ impl Variant {
                 _ => format!("{qsetup}\n{}", include_str!("../shader/msaa_flat.wgsl")),
             };
             return format!(
-                "{enable}const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\nconst MPROF: u32 = {}u;\nconst MABL: u32 = {}u;\nconst SGSCAN: u32 = {}u;\n{}\n{body}",
+                "{enable}const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\nconst MPROF: u32 = {}u;\nconst MABL: u32 = {}u;\nconst SGSCAN: u32 = {}u;\nconst SGRED: u32 = {}u;\n{}\n{body}",
                 TILE,
                 self.wg_size,
                 self.cell_mode,
                 mprof,
                 mabl,
                 sgscan,
+                sgred,
                 include_str!("../shader/msaa_common.wgsl")
             );
         }
