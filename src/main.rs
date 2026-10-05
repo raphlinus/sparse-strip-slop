@@ -655,6 +655,124 @@ fn fold_flat_partials(items: &[[u32; 4]], a: usize, b: usize, first: u32, partia
     w
 }
 
+/// Host mirror of the GPU expansion: item/run/record counts for buffer sizing, and per-run
+/// layout (item base, quadrant counts, partial flag) for folding results.
+struct RunLayout {
+    base: usize,
+    cnt: [u32; 4],
+    partial: bool,
+}
+
+fn mirror_expansion(scene: &Scene, entries: &[tiler::Entry], wg: usize) -> (usize, usize, usize, Vec<RunLayout>) {
+    let dummy_line = scene.lines.len() as u32;
+    let mut layouts = Vec::new();
+    let mut n_items = 0usize;
+    let mut n_records = 0usize;
+    let mut n_runs = 0usize;
+    let mut i = 0;
+    while i < entries.len() {
+        let key = entries[i].key;
+        let mut j = i;
+        let mut cnt = [0u32; 4];
+        while j < entries.len() && entries[j].key == key {
+            let e = &entries[j];
+            let li = e.line & 0x0fff_ffff;
+            if li < dummy_line {
+                let line = &scene.lines[li as usize];
+                let m = quadrants_touched(line, e.key & 0x3ff, (e.key >> 10) & 0x3ff);
+                for q in 0..4 {
+                    cnt[q] += (m >> q) & 1;
+                }
+            }
+            j += 1;
+        }
+        let base = n_items;
+        let mut g = base;
+        let mut partial = false;
+        for q in 0..4 {
+            let c = cnt[q] as usize;
+            if c > 8 || (c > 0 && g / wg != (g + c - 1) / wg) {
+                partial = true;
+            }
+            g += c;
+        }
+        if partial {
+            let mut gq = base;
+            for q in 0..4 {
+                let c = cnt[q] as usize;
+                if c == 0 {
+                    n_records += 1;
+                } else {
+                    let mut p = gq;
+                    while p < gq + c {
+                        n_records += 1;
+                        let nb = (p / wg + 1) * wg;
+                        p = (p + 8).min(nb);
+                    }
+                }
+                gq += c;
+            }
+        }
+        n_items = g;
+        n_runs += 1;
+        layouts.push(RunLayout { base, cnt, partial });
+        i = j;
+    }
+    (n_items, n_runs, n_records, layouts)
+}
+
+/// Fold the expanded pipeline's output for one run into per-pixel masks.
+fn fold_expanded(res: &gpu::ExpandedResult, ri: usize, lay: &RunLayout, even_odd: bool) -> [u16; PIXELS] {
+    let mut m = [0u16; PIXELS];
+    if !lay.partial {
+        let words = &res.masks[ri * 32..ri * 32 + 32];
+        for y in 0..TILE {
+            for x in 0..TILE {
+                let ci = reference::quadrant_major_index(x, y);
+                m[(y * TILE + x) as usize] = (words[ci / 2] >> (16 * (ci % 2))) as u16;
+            }
+        }
+        return m;
+    }
+    let mut w = vec![[0i32; 16]; PIXELS];
+    let mut decode = |rec: usize, q: u32| {
+        for p in 0..16u32 {
+            let base = (rec * 16 + p as usize) * 4;
+            let w0 = res.partials[base] as u32;
+            let w1 = res.partials[base + 1] as u32;
+            let own = res.partials[base + 2] as u32;
+            let bd = res.partials[base + 3];
+            let x = 4 * (q & 1) + (p & 3);
+            let y = 4 * (q >> 1) + (p >> 2);
+            let pix = (y * TILE + x) as usize;
+            for sidx in 0..16 {
+                let word = if sidx < 8 { w0 } else { w1 };
+                let lane = ((word >> (4 * (sidx & 7))) & 0xf) as i32 - 8;
+                let o = ((own >> sidx) & 1) as i32 - ((own >> (16 + sidx)) & 1) as i32;
+                w[pix][sidx] += lane + o + bd;
+            }
+        }
+    };
+    let mut g = lay.base;
+    for q in 0..4u32 {
+        let c = lay.cnt[q as usize] as usize;
+        if c == 0 {
+            let rec = res.run_info[ri * 4 + q as usize];
+            assert!(rec < 0xffff_fffe, "missing uniform record for run {ri} q {q}");
+            decode(rec as usize, q);
+        } else {
+            for p in g..g + c {
+                let e4 = res.entries4[p];
+                if e4.out & tiler::OUT_PARTIAL != 0 {
+                    decode((e4.out & !tiler::OUT_PARTIAL) as usize, q);
+                }
+            }
+        }
+        g += c;
+    }
+    std::array::from_fn(|i| msaa::resolve_mask(&w[i], even_odd))
+}
+
 /// MSAA 16 path: CPU reference against the sample-point oracle, then GPU variants.
 fn msaa_main() {
     let args: Vec<String> = std::env::args().collect();
@@ -971,6 +1089,160 @@ fn msaa_main() {
                 .collect();
             let (img_gpu, _) = composite_and_check(&scene, &tiled, &alphas, false);
             img_gpu.write_png(&format!("{out_dir}/msaa_gpu.png"));
+        }
+    }
+
+    // GPU expansion pipeline: 8x8 entries -> 4x4 quadrant entries -> merge.
+    if TILE == 8 {
+        for cell_mode in [0u32, 3] {
+            let wg = 256usize;
+            let mut tiled = tiler::tile(&scene, wg, usize::MAX);
+            let ref_masks: Vec<[u16; PIXELS]> = tiled
+                .runs
+                .iter()
+                .map(|r| {
+                    let eo = scene.paths[r.path as usize].even_odd;
+                    let w = msaa::run_sample_winding(&lut, &scene, &tiled, r);
+                    std::array::from_fn(|i| msaa::resolve_mask(&w[i], eo))
+                })
+                .collect();
+            if replicate > 1 {
+                tiler::replicate(&mut tiled, replicate, scene.paths.len() as u32);
+            }
+            let (n_items, n_runs, n_records, layouts) = mirror_expansion(&scene, &tiled.entries, wg);
+            let cm = ["inlinelut", "fifolut", "direct", "alwayslut"][cell_mode as usize];
+            println!("== expanded_{cm}_wg{wg} ==");
+            println!("  host mirror: {} items, {} runs, {} partial records", n_items, n_runs, n_records);
+            let res = gpu.run_expanded(
+                wg as u32,
+                cell_mode,
+                &lines_padded,
+                &tiled.entries,
+                &path_flags,
+                &lut_packed,
+                n_items,
+                n_runs,
+                n_records,
+                scene.lines.len() as u32,
+                iterations,
+            );
+            println!("  gpu counters: {} items, {} runs", res.n_items, res.n_runs);
+            if std::env::var("EXPDET").is_ok() {
+                // Determinism check: run again and diff per-run results.
+                let res2 = gpu.run_expanded(wg as u32, cell_mode, &lines_padded, &tiled.entries, &path_flags,
+                    &lut_packed, n_items, n_runs, n_records, scene.lines.len() as u32, 5);
+                let mut nd = 0;
+                for (ri, r) in tiled.runs.iter().enumerate() {
+                    let eo = scene.paths[r.path as usize].even_odd;
+                    let a = fold_expanded(&res, ri, &layouts[ri], eo);
+                    let b = fold_expanded(&res2, ri, &layouts[ri], eo);
+                    if a != b {
+                        nd += 1;
+                        if nd <= 5 {
+                            let lay = &layouts[ri];
+                            let d: u32 = (0..PIXELS).map(|i| (a[i] ^ b[i]).count_ones()).sum();
+                            println!("  nondeterministic run {} partial {} cnt {:?} base {} ({} samples differ)", ri, lay.partial, lay.cnt, lay.base, d);
+                            for e in &tiled.entries[r.entry_start as usize..r.entry_end as usize] {
+                                let l = scene.lines[(e.line & 0x0fff_ffff) as usize];
+                                let ox = r.tx as f32 * 8.0;
+                                let oy = r.ty as f32 * 8.0;
+                                println!("    entry: local ({:.4}, {:.4}) -> ({:.4}, {:.4}) left_edge {} backdrop {}",
+                                    l[0] - ox, l[1] - oy, l[2] - ox, l[3] - oy, e.line & LINE_LEFT_EDGE != 0, e.backdrop);
+                            }
+                        }
+                    }
+                }
+                println!("  determinism: {} runs differ between two executions", nd);
+            }
+            let mut cols = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+            for row in &res.times_ms[1..] {
+                for k in 0..6 {
+                    if row[k] > 0.0 {
+                        cols[k].push(row[k]);
+                    }
+                }
+            }
+            let med = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                if v.is_empty() { 0.0 } else { v[v.len() / 2] }
+            };
+            let m: Vec<f64> = cols.iter_mut().map(med).collect();
+            let expand: f64 = m[..5].iter().sum();
+            println!(
+                "  gpu: expansion {:.3} ms (map {:.3}, scan {:.3}, runs {:.3}, scatter {:.3}, fixup {:.3}), merge {:.3} ms, total {:.3} ms",
+                expand, m[0], m[1], m[2], m[3], m[4], m[5], expand + m[5]
+            );
+            let mut runs_diff = 0usize;
+            let mut pixels_diff = 0usize;
+            let mut samples_diff = 0usize;
+            let mut worst: Option<(usize, u32)> = None;
+            for (ri, r) in tiled.runs.iter().enumerate() {
+                let eo = scene.paths[r.path as usize].even_odd;
+                let gm = fold_expanded(&res, ri, &layouts[ri], eo);
+                let mut d_run = 0u32;
+                for i in 0..PIXELS {
+                    let d = (gm[i] ^ ref_masks[ri][i]).count_ones();
+                    d_run += d;
+                    pixels_diff += (d > 0) as usize;
+                    samples_diff += d as usize;
+                }
+                if d_run > 0 {
+                    runs_diff += 1;
+                    if worst.is_none_or(|(_, b)| d_run > b) {
+                        worst = Some((ri, d_run));
+                    }
+                }
+            }
+            println!(
+                "  gpu vs reference: {} of {} runs differ, {} pixels, {} samples",
+                runs_diff, tiled.runs.len(), pixels_diff, samples_diff
+            );
+            if let Some((ri, d)) = worst {
+                let r = &tiled.runs[ri];
+                println!(
+                    "  worst: run {} path {} tile ({}, {}) entries {}..{} partial {}: {} samples",
+                    ri, r.path, r.tx, r.ty, r.entry_start, r.entry_end, layouts[ri].partial, d
+                );
+            }
+            if let Some(dump) = std::env::var("EXPDUMP").ok().and_then(|v| v.parse::<usize>().ok()) {
+                let r = &tiled.runs[dump];
+                let eo = scene.paths[r.path as usize].even_odd;
+                let gm = fold_expanded(&res, dump, &layouts[dump], eo);
+                println!("  dump run {} partial {} cnt {:?} base {}", dump, layouts[dump].partial, layouts[dump].cnt, layouts[dump].base);
+                for e in &tiled.entries[r.entry_start as usize..r.entry_end as usize] {
+                    let l = scene.lines[(e.line & 0x0fff_ffff) as usize];
+                    let ox = r.tx as f32 * 8.0;
+                    let oy = r.ty as f32 * 8.0;
+                    println!("    entry: local ({:.5}, {:.5}) -> ({:.5}, {:.5}) left_edge {} backdrop {}",
+                        l[0] - ox, l[1] - oy, l[2] - ox, l[3] - oy, e.line & LINE_LEFT_EDGE != 0, e.backdrop);
+                }
+                let lay = &layouts[dump];
+                let mut g = lay.base;
+                for q in 0..4 {
+                    for p in g..g + lay.cnt[q] as usize {
+                        let e4 = res.entries4[p];
+                        println!("    item pos {} q {} line {} flag {} backdrop {} out {:#x}", p, q, e4.line & 0x0fff_ffff, e4.line >> 31, e4.backdrop, e4.out);
+                    }
+                    g += lay.cnt[q] as usize;
+                }
+                for y in 0..8 {
+                    let row: Vec<String> = (0..8).map(|x| format!("{:04x}/{:04x}", gm[y * 8 + x], ref_masks[dump][y * 8 + x])).collect();
+                    println!("    {}", row.join(" "));
+                }
+            }
+            if std::env::var("EXPLIST").is_ok() {
+                let mut ids = Vec::new();
+                for (ri, r) in tiled.runs.iter().enumerate() {
+                    let eo = scene.paths[r.path as usize].even_odd;
+                    let gm = fold_expanded(&res, ri, &layouts[ri], eo);
+                    let d: u32 = (0..PIXELS).map(|i| (gm[i] ^ ref_masks[ri][i]).count_ones()).sum();
+                    if d > 0 {
+                        let c = layouts[ri].cnt;
+                        ids.push(format!("{ri}:{d}:p{}:c{}-{}-{}-{}", layouts[ri].partial as u8, c[0], c[1], c[2], c[3]));
+                    }
+                }
+                println!("  difflist {}", ids.join(" "));
+            }
         }
     }
 }

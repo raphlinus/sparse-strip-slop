@@ -405,6 +405,49 @@ Net: 8x8 entries into the sort with 4x4-granularity MSAA merging costs 0.81 ms a
 45% of the gap. Further gains are in the setup bookkeeping, or in having the expansion
 pass precompute per-entry deltas and the quadrant setup so the merge only scans and walks.
 
+## GPU expansion pass + 4x4 merge (`shader/expand.wgsl`, `shader/msaa_items.wgsl`)
+
+A real GPU pipeline: sorted 8x8 entries -> 4x4 quadrant entries -> the one-item-per-thread
+MSAA merge. Five expansion dispatches sharing one bind group (8 storage buffers, the
+per-stage limit): e1 map + per-workgroup segmented scan (touched quadrants, deltas, run
+boundaries), e2 scan of workgroup aggregates (one workgroup, chunked), e3 per entry (run
+id, item base, per-(run, quadrant) counts via atomics, run meta and delta totals), e5
+scatter (position = run base + quadrant group base + atomic fill rank; order within a
+group is irrelevant), e4 per run (backdrop + delta on group heads, partial decision,
+record allocation with pieces of 8 restarting at workgroup boundaries like the merge,
+uniform output or record for untouched quadrants). 4x4 entry: 8x8 key, line | tile flag
+| quadrant << 28, backdrop on group heads, out = run id or OUT_PARTIAL | record. The host
+mirrors the expansion only to size buffers and fold results; GPU counters match it
+exactly (85733 items, 26552 runs at 1x). Results are deterministic across processes
+after fixing a slot-initialization race in the merge (init must precede the scan's
+barriers). Hundreds of passes in one command buffer lost the Metal device; submissions
+are chunked.
+
+Same scene, 16x replicated, median ms:
+
+| stage                                    | ms    |
+|------------------------------------------|-------|
+| e1 map + local scan                      | 0.114 |
+| e2 aggregate scan                        | 0.040 |
+| e3 run ids, counts                       | 0.122 |
+| e5 scatter                               | 0.121 |
+| e4 per-run fixup                         | 0.265 |
+| expansion total                          | 0.662 |
+| merge over 4x4 entries                   | 0.498 |
+| pipeline total                           | 1.160 |
+| one-line 8x8 MSAA merge (no expansion)   | 1.040 |
+| flat variant (expansion inside merge)    | 0.814 |
+| one-line 4x4 MSAA (native 4x4 tiler)     | 0.52  |
+
+The merge does land on the 4x4 number, as predicted. But this first-cut expansion costs
+0.66 ms, more than the 0.54 it saves. It is unoptimized (global atomics per entry per
+quadrant in e3 and e5, a per-run fixup with loops, a 69 MB scratch buffer); a fused
+version with packed-count scans and a per-group-head fixup might reach ~0.3-0.35 ms,
+which would land the total near the flat variant's 0.81. The floor is the 22 MB of 4x4
+entries written and re-read plus the per-(run, quadrant) bookkeeping. Conclusion: 8x8
+entries with 4x4-granularity merging recovers at most about half of the 1.04 -> 0.52 gap,
+whichever side of the dispatch boundary the expansion sits on.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and

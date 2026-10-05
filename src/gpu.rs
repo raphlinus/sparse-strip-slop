@@ -182,6 +182,9 @@ impl Gpu {
             ..Default::default()
         }))
         .expect("no device");
+        device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+            eprintln!("wgpu uncaptured error: {e}");
+        }));
         Self {
             device,
             queue,
@@ -407,5 +410,284 @@ impl Gpu {
             partials,
             times_ms,
         }
+    }
+}
+
+/// Result of the GPU expansion + merge pipeline.
+pub struct ExpandedResult {
+    pub masks: Vec<u32>,
+    pub partials: Vec<i32>,
+    pub entries4: Vec<Entry>,
+    /// run_info[run * 4 + q]: record index of an untouched quadrant's uniform record,
+    /// NONE (0xffffffff) for touched quadrants, NONE - 1 for untouched in resolved runs.
+    pub run_info: Vec<u32>,
+    pub n_runs: u32,
+    pub n_items: u32,
+    /// Per iteration: [e1, e2, e3, e5, e4, merge] milliseconds.
+    pub times_ms: Vec<[f64; 6]>,
+}
+
+impl Gpu {
+    /// Expand sorted 8x8 entries into 4x4 quadrant entries on the GPU, then merge.
+    /// `n_items`, `n_runs_total` and `n_records` are host-side upper bounds for buffer sizes.
+    pub fn run_expanded(
+        &self,
+        wg_size: u32,
+        cell_mode: u32,
+        lines: &[[f32; 4]],
+        entries8: &[Entry],
+        path_flags: &[u32],
+        lut: &[u32],
+        n_items: usize,
+        n_runs_total: usize,
+        n_records: usize,
+        dummy_line: u32,
+        iterations: u32,
+    ) -> ExpandedResult {
+        let device = &self.device;
+        let n = entries8.len();
+        assert_eq!(n % wg_size as usize, 0);
+        let n_wg = (n / wg_size as usize) as u32;
+        let n4 = n_items.div_ceil(wg_size as usize) * wg_size as usize;
+        let n4 = n4.max(wg_size as usize);
+        let n_mask_slots = n_runs_total + 2; // + dummy slot for the sentinel run and padding
+
+        // Scratch layout (u32 words).
+        let off_base = 0usize;
+        let off_cnt = n;
+        let off_fill = 5 * n;
+        let off_delta = 9 * n;
+        let off_meta = 13 * n;
+        let off_rinfo = 17 * n;
+        let off_ctr = 21 * n;
+        let off_flags = 21 * n + 4;
+        let scratch_len = off_flags + path_flags.len().max(1);
+        let header = format!(
+            "const WG_SIZE: u32 = {wg_size}u;\nconst N: u32 = {n}u;\nconst N_WG: u32 = {n_wg}u;\n\
+             const OFF_BASE: u32 = {off_base}u;\nconst OFF_CNT: u32 = {off_cnt}u;\nconst OFF_FILL: u32 = {off_fill}u;\n\
+             const OFF_DELTA: u32 = {off_delta}u;\nconst OFF_META: u32 = {off_meta}u;\nconst OFF_RINFO: u32 = {off_rinfo}u;\n\
+             const OFF_CTR: u32 = {off_ctr}u;\nconst OFF_FLAGS: u32 = {off_flags}u;\n"
+        );
+        let expand_src = format!("{header}{}", include_str!("../shader/expand.wgsl"));
+        let expand_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("expand"),
+            source: wgpu::ShaderSource::Wgsl(expand_src.into()),
+        });
+        let bgl_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..8)
+            .map(|b| wgpu::BindGroupLayoutEntry {
+                binding: b,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("expand"),
+            entries: &bgl_entries,
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("expand"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let make = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&layout),
+                module: &expand_module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let p_e1 = make("e1_map");
+        let p_e2 = make("e2_scan");
+        let p_e3 = make("e3_runs");
+        let p_e5 = make("e5_scatter");
+        let p_e4 = make("e4_fixup");
+
+        let merge_src = format!(
+            "const TILE: u32 = 8u;\nconst WG_SIZE: u32 = {wg_size}u;\nconst CELL_MODE: u32 = {cell_mode}u;\nconst MPROF: u32 = 0u;\nconst MABL: u32 = 0u;\n{}\n{}\n{}",
+            include_str!("../shader/msaa_common.wgsl"),
+            include_str!("../shader/msaa_quadrant_setup.wgsl"),
+            include_str!("../shader/msaa_items.wgsl")
+        );
+        let merge_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("msaa_items"),
+            source: wgpu::ShaderSource::Wgsl(merge_src.into()),
+        });
+        let p_merge = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("msaa_items"),
+            layout: None,
+            module: &merge_module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let storage = wgpu::BufferUsages::STORAGE;
+        let rw = storage | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        let mk_init = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage })
+        };
+        let lines_buf = mk_init("lines", bytemuck::cast_slice(lines), storage);
+        let entries8_buf = mk_init("entries8", bytemuck::cast_slice(entries8), storage);
+        let info_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("info"), size: (n * 16) as u64, usage: storage, mapped_at_creation: false,
+        });
+        let agg_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("agg"), size: (4 * n_wg as usize * 16 + 32) as u64, usage: storage, mapped_at_creation: false,
+        });
+        let mut scratch_init = vec![0u32; scratch_len];
+        scratch_init[off_flags..off_flags + path_flags.len()].copy_from_slice(path_flags);
+        let scratch_buf = mk_init("scratch", bytemuck::cast_slice(&scratch_init), rw);
+        let sentinel = Entry { key: crate::tiler::SENTINEL_KEY, line: dummy_line, backdrop: 0, out: (n_mask_slots - 1) as u32 };
+        let entries4_init = vec![sentinel; n4];
+        let entries4_buf = mk_init("entries4", bytemuck::cast_slice(&entries4_init), rw);
+        let mask_size = (n_mask_slots * 32 * 4) as u64;
+        let partials_size = (n_records.max(1) * 64 * 4) as u64;
+        let mask_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mask_out"), size: mask_size, usage: rw, mapped_at_creation: false,
+        });
+        let partials_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("partials"), size: partials_size, usage: rw, mapped_at_creation: false,
+        });
+        let flags_buf = mk_init("path_flags", bytemuck::cast_slice(path_flags), storage);
+        let lut_buf = mk_init("mask_lut", bytemuck::cast_slice(lut), storage);
+
+        let expand_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("expand"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: lines_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: entries8_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: info_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: agg_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: scratch_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: entries4_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: mask_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: partials_buf.as_entire_binding() },
+            ],
+        });
+        let merge_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("merge"),
+            layout: &p_merge.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: lines_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: entries4_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: mask_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: partials_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: flags_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: lut_buf.as_entire_binding() },
+            ],
+        });
+
+        let n_passes = 6u32;
+        let n_queries = 2 * n_passes * iterations;
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("timestamps"), ty: wgpu::QueryType::Timestamp, count: n_queries,
+        });
+        let qbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("query resolve"), size: 8 * n_queries as u64,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+        });
+        let readback_size = mask_size + partials_size + (n4 * 16) as u64 + (4 * n * 4) as u64 + 16;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"), size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+        });
+        let qread = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("query readback"), size: 8 * n_queries as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false,
+        });
+
+        let total_iters = iterations + iterations.max(20);
+        // Submit in chunks: one command buffer with hundreds of passes was lost on Metal.
+        let chunk = 25u32;
+        let mut it = 0u32;
+        while it < total_iters {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            let end = (it + chunk).min(total_iters);
+            while it < end {
+                // Reset per-(run, quadrant) counts and fills, and the counters.
+                encoder.clear_buffer(&scratch_buf, (off_cnt * 4) as u64, Some(((off_delta - off_cnt) * 4) as u64));
+                encoder.clear_buffer(&scratch_buf, (off_ctr * 4) as u64, Some(16));
+                let timed = it >= total_iters - iterations;
+                let base_q = if timed { 2 * n_passes * (it - (total_iters - iterations)) } else { 0 };
+                let passes: [(&wgpu::ComputePipeline, &wgpu::BindGroup, u32); 6] = [
+                    (&p_e1, &expand_bg, n_wg),
+                    (&p_e2, &expand_bg, 1),
+                    (&p_e3, &expand_bg, n_wg),
+                    (&p_e5, &expand_bg, n_wg),
+                    (&p_e4, &expand_bg, n_wg),
+                    (&p_merge, &merge_bg, (n4 / wg_size as usize) as u32),
+                ];
+                for (k, (pipe, bg, groups)) in passes.iter().enumerate() {
+                    let tw = timed.then(|| wgpu::ComputePassTimestampWrites {
+                        query_set: &query_set,
+                        beginning_of_pass_write_index: Some(base_q + 2 * k as u32),
+                        end_of_pass_write_index: Some(base_q + 2 * k as u32 + 1),
+                    });
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: tw });
+                    pass.set_pipeline(pipe);
+                    pass.set_bind_group(0, *bg, &[]);
+                    pass.dispatch_workgroups(*groups, 1, 1);
+                }
+                it += 1;
+            }
+            self.queue.submit([encoder.finish()]);
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let mut off = 0u64;
+        encoder.copy_buffer_to_buffer(&mask_buf, 0, &readback, off, mask_size);
+        off += mask_size;
+        encoder.copy_buffer_to_buffer(&partials_buf, 0, &readback, off, partials_size);
+        off += partials_size;
+        encoder.copy_buffer_to_buffer(&entries4_buf, 0, &readback, off, (n4 * 16) as u64);
+        off += (n4 * 16) as u64;
+        encoder.copy_buffer_to_buffer(&scratch_buf, (off_rinfo * 4) as u64, &readback, off, (4 * n * 4) as u64);
+        off += (4 * n * 4) as u64;
+        encoder.copy_buffer_to_buffer(&scratch_buf, (off_ctr * 4) as u64, &readback, off, 16);
+        encoder.resolve_query_set(&query_set, 0..n_queries, &qbuf, 0);
+        encoder.copy_buffer_to_buffer(&qbuf, 0, &qread, 0, 8 * n_queries as u64);
+        self.queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        qread.slice(..).map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+
+        let data = readback.slice(..).get_mapped_range().expect("mapped");
+        let mut off = 0usize;
+        let masks: Vec<u32> = bytemuck::cast_slice(&data[off..off + mask_size as usize]).to_vec();
+        off += mask_size as usize;
+        let partials: Vec<i32> = bytemuck::cast_slice(&data[off..off + partials_size as usize]).to_vec();
+        off += partials_size as usize;
+        let entries4: Vec<Entry> = bytemuck::cast_slice(&data[off..off + n4 * 16]).to_vec();
+        off += n4 * 16;
+        let run_info: Vec<u32> = bytemuck::cast_slice(&data[off..off + 4 * n * 4]).to_vec();
+        off += 4 * n * 4;
+        let ctr: Vec<u32> = bytemuck::cast_slice(&data[off..off + 16]).to_vec();
+        drop(data);
+        readback.unmap();
+        let period = self.queue.get_timestamp_period() as f64;
+        let qd = qread.slice(..).get_mapped_range().expect("mapped");
+        let ts: &[u64] = bytemuck::cast_slice(&qd);
+        let mut times_ms = Vec::new();
+        for it in 0..iterations as usize {
+            let mut row = [0f64; 6];
+            for k in 0..6 {
+                let a = ts[it * 12 + 2 * k];
+                let b = ts[it * 12 + 2 * k + 1];
+                row[k] = b.wrapping_sub(a) as f64 * period * 1e-6;
+            }
+            times_ms.push(row);
+        }
+        drop(qd);
+        qread.unmap();
+        assert!(ctr[0] as usize <= n_records, "record allocation {} exceeds host bound {}", ctr[0], n_records);
+        ExpandedResult { masks, partials, entries4, run_info, n_runs: ctr[1], n_items: ctr[2], times_ms }
     }
 }

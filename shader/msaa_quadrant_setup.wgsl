@@ -86,7 +86,7 @@ fn q_payload(s: QSetup, hp: u32, rm: RowMasks) -> vec2<u32> {
 // rule. The y_edge for the left quadrants uses the same expression as msaa_common::setup so
 // its sample-row boundary rounds identically to the 8x8 reference.
 fn setup_quad(ent: Entry, q: u32) -> QSetup {
-    let l = lines[ent.line & ~LINE_LEFT_EDGE];
+    let l = lines[ent.line & 0x0fffffffu];
     let origin = vec2(f32((ent.key & 0x3ffu) * TILE), f32(((ent.key >> 10u) & 0x3ffu) * TILE));
     let p0 = l.xy - origin;
     let p1 = l.zw - origin;
