@@ -26,10 +26,37 @@ fn record_index(h: u32, q: u32, k: u32) -> u32 {
     return ix + k;
 }
 
+// 128-bit ballot helpers (subgroup size up to 128; Apple uses 32).
+fn ballot_below(lane: u32) -> vec4<u32> {
+    // Bits 0..=lane set.
+    var m = vec4(0u, 0u, 0u, 0u);
+    for (var w = 0u; w < 4u; w++) {
+        let lo = w * 32u;
+        if lane >= lo + 31u {
+            m[w] = 0xffffffffu;
+        } else if lane >= lo {
+            m[w] = (2u << (lane - lo)) - 1u;
+        }
+    }
+    return m;
+}
+fn ballot_any(b: vec4<u32>) -> bool {
+    return (b.x | b.y | b.z | b.w) != 0u;
+}
+fn ballot_high(b: vec4<u32>) -> u32 {
+    // Position of the highest set bit (requires ballot_any).
+    if b.w != 0u { return 96u + firstLeadingBit(b.w); }
+    if b.z != 0u { return 64u + firstLeadingBit(b.z); }
+    if b.y != 0u { return 32u + firstLeadingBit(b.y); }
+    return firstLeadingBit(b.x);
+}
+
 @compute @workgroup_size(WG_SIZE)
 fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(subgroup_size) sg_size: u32,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
 ) {
     let t = local_id.x;
     let p = wg_id.x * WG_SIZE + t;
@@ -63,21 +90,61 @@ fn main(
     }
     var vr = select(0u, t, run_b);
     var vg = select(0u, t, grp_b);
-    sh_run[t] = vr;
-    sh_grp[t] = vg;
-    for (var i = 0u; i < firstTrailingBit(WG_SIZE); i++) {
-        workgroupBarrier();
-        var orr = 0u;
-        var org = 0u;
-        if t >= (1u << i) {
-            orr = sh_run[t - (1u << i)];
-            org = sh_grp[t - (1u << i)];
-        }
-        workgroupBarrier();
-        vr = max(vr, orr);
-        vg = max(vg, org);
+    if SGSCAN == 0u {
         sh_run[t] = vr;
         sh_grp[t] = vg;
+        for (var i = 0u; i < firstTrailingBit(WG_SIZE); i++) {
+            workgroupBarrier();
+            var orr = 0u;
+            var org = 0u;
+            if t >= (1u << i) {
+                orr = sh_run[t - (1u << i)];
+                org = sh_grp[t - (1u << i)];
+            }
+            workgroupBarrier();
+            vr = max(vr, orr);
+            vg = max(vg, org);
+            sh_run[t] = vr;
+            sh_grp[t] = vg;
+        }
+    } else {
+        // Subgroup version: ballot the boundary flags; the head is the highest set bit at or
+        // below this lane, else the last boundary of an earlier subgroup (shared, one barrier).
+        let sg = t / sg_size;
+        let br = subgroupBallot(run_b);
+        let bg = subgroupBallot(grp_b);
+        let below = ballot_below(sg_lane);
+        let br_m = br & below;
+        let bg_m = bg & below;
+        let hr = ballot_high(br_m);
+        let hg = ballot_high(bg_m);
+        if sg_lane == sg_size - 1u {
+            sh_run[sg] = select(0xffffffffu, sg * sg_size + ballot_high(br), ballot_any(br));
+            sh_grp[sg] = select(0xffffffffu, sg * sg_size + ballot_high(bg), ballot_any(bg));
+        }
+        workgroupBarrier();
+        vr = sg * sg_size + hr;
+        if !ballot_any(br_m) {
+            vr = 0u;
+            for (var k = sg; k > 0u; k--) {
+                let v = sh_run[k - 1u];
+                if v != 0xffffffffu {
+                    vr = v;
+                    break;
+                }
+            }
+        }
+        vg = sg * sg_size + hg;
+        if !ballot_any(bg_m) {
+            vg = 0u;
+            for (var k = sg; k > 0u; k--) {
+                let v = sh_grp[k - 1u];
+                if v != 0xffffffffu {
+                    vg = v;
+                    break;
+                }
+            }
+        }
     }
     let run_head = vr;
     let grp_head = vg;

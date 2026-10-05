@@ -448,6 +448,16 @@ entries written and re-read plus the per-(run, quadrant) bookkeeping. Conclusion
 entries with 4x4-granularity merging recovers at most about half of the 1.04 -> 0.52 gap,
 whichever side of the dispatch boundary the expansion sits on.
 
+## Subgroup scans (flat variant, `SGSCAN=1`)
+
+The two 8-round shared-memory prefix-max scans (run head, group head) replaced by
+subgroup ballots: the head is the highest boundary bit at or below the lane, else the last
+boundary of an earlier subgroup via an 8-entry shared table and one barrier. WGSL in wgpu
+30 has no prefix-max, but ballot + mask + firstLeadingBit is constant time; naga accepts
+the subgroup builtins without the `enable subgroups` directive. Result: 0.820 -> 0.792 ms
+(3.4%), bit-identical output. As estimated, the scans are a small part of setup; the
+geometry, fetches and per-(run, quadrant) bookkeeping remain.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and
