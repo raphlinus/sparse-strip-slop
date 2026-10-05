@@ -500,6 +500,42 @@ workgroups at 256 invocations):
 Flat from 64 to 256, then worse: +9% at 512, +30% at 1024, where the 128-barrier-pair
 cell loop synchronizes more threads per barrier and occupancy per core drops.
 
+## Final summary (2026-10-05)
+
+Best surviving 8x8 MSAA16 configuration: the dense one-line kernel, one entry per thread,
+one pixel per barrier pair, classify every cell against the infinite line and gather the
+LUT mask for all of them, 4-bit lane accumulation with the head's own payload in registers
+and pieces of head + 7, SWAR resolve. Bit-exact against the CPU reference; 1.03 ms on the
+16x replicated 1600x1600 tiger against 0.50 for the same scene tiled at 4x4.
+
+The case for 8x8 rests outside the merge: 51K entries through tile and sort instead of
+86K, 26.5K runs through strip allocation and seam joining instead of 57.5K. Those stages
+are not measured here; 8x8 wins overall only if their savings exceed the ~0.5 ms the merge
+loses at this scale.
+
+Honest ledger of the 8x8 MSAA variants (16x replicated, median ms):
+
+| variant                                  | ms   | hidden cost                          |
+|------------------------------------------|------|--------------------------------------|
+| dense one-line                           | 1.03 | none                                 |
+| three-slot quadrant, in-shader expansion | 0.96 | none                                 |
+| flat, host-built item list               | 0.81 | item list (~0.4 ms on GPU as built)  |
+| GPU expansion pass + 4x4 merge           | 1.15 | none                                 |
+| native 4x4 tiler (reference)             | 0.50 | sort and allocation at 4x4           |
+
+The three-slot quadrant kernel is a minor (7%) win over dense and plug-compatible with it:
+same inputs, same per-run 64-pixel output (quadrant-major), tie-level identical results;
+its allocation stage counts items per (run, quadrant) rather than entries per run.
+Untouched quadrants are currently written as uniform values; a per-run two-bits-per-
+quadrant header (inside / outside / data) would drop those writes and shrink mask storage
+to ~55%, needing only the touched-quadrant counts the expansion already produces.
+
+Everything else tried lost or tied on this GPU: coset FIFOs, two lines per thread, chunks
+above 1, sparse LUT gathers, row skipping, subgroup reductions in place of shared atomics,
+workgroups above 256. Subgroup scans gained ~3%. The merge is bounded by per-cell payload
+arithmetic and register footprint; 4x4 does a quarter of the cells per item, which is why
+it is 2x faster regardless of how the items are produced.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and
