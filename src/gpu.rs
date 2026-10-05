@@ -95,17 +95,19 @@ impl Variant {
         );
         if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 {
             let mprof: u32 = std::env::var("MPROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let mabl: u32 = std::env::var("MABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let body = if self.mode == Mode::Msaa {
                 include_str!("../shader/msaa1.wgsl")
             } else {
                 include_str!("../shader/msaa2.wgsl")
             };
             return format!(
-                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\nconst MPROF: u32 = {}u;\n{}\n{body}",
+                "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\nconst MPROF: u32 = {}u;\nconst MABL: u32 = {}u;\n{}\n{body}",
                 TILE,
                 self.wg_size,
                 self.cell_mode,
                 mprof,
+                mabl,
                 include_str!("../shader/msaa_common.wgsl")
             );
         }

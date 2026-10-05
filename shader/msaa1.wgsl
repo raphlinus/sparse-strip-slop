@@ -86,8 +86,16 @@ fn main(
                 hp = direct_mask(s, x, y);
             }
             let pm = cell_payload(s, hp, rm);
-            let lo = spread8(pm.x & 0xffu) - spread8(pm.y & 0xffu);
-            let hi = spread8(pm.x >> 8u) - spread8(pm.y >> 8u);
+            var lo: u32;
+            var hi: u32;
+            if MPROF == 4u {
+                // Ablation: skip the lane spreads (wrong results, same traffic).
+                lo = pm.x - pm.y;
+                hi = pm.x ^ pm.y;
+            } else {
+                lo = spread8(pm.x & 0xffu) - spread8(pm.y & 0xffu);
+                hi = spread8(pm.x >> 8u) - spread8(pm.y >> 8u);
+            }
 
             if MPROF == 2u {
                 // Payload compute only.

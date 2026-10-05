@@ -186,6 +186,10 @@ fn lut_mask(s: Setup, x: u32, y: u32) -> u32 {
     let row = u32(floor(min(s.la * hh, hh - 1.0))) * MASK16_WIDTH;
     let col = u32(floor((zf - z) * f32(MASK16_WIDTH)));
     let ix = block + row + col;
+    if (MABL & 1u) != 0u {
+        // Ablation: no gather, a mask derived from the index arithmetic instead.
+        return (0xffffu << (ix & 15u)) & 0xffffu;
+    }
     return (mask_lut[ix >> 1u] >> ((ix & 1u) * 16u)) & 0xffffu;
 }
 
@@ -201,6 +205,10 @@ fn direct_mask(s: Setup, x: u32, y: u32) -> u32 {
 }
 
 fn classify(s: Setup, x: u32, y: u32) -> vec2<bool> {
+    if (MABL & 2u) != 0u {
+        // Ablation: no classification arithmetic; alternate hit/side by position.
+        return vec2(((x ^ y) & 1u) != 0u, (x & 1u) != 0u);
+    }
     let t_y = s.b * (f32(y) + 0.5) - s.d;
     let v = fma(s.a, f32(x) + 0.5, t_y);
     return vec2(abs(v) < s.h, (v > 0.0) == (s.a > 0.0));
@@ -212,6 +220,8 @@ fn classify(s: Setup, x: u32, y: u32) -> vec2<bool> {
 // lane != base - own with base = 8 - backdrop; lanes are in [1, 15], so expected values
 // outside that range never match, encoded below with e = 0 or a forced bit. Even-odd:
 // parity of lane + own + backdrop.
+// The spreads of the head's own payload are recomputed here rather than passed in:
+// keeping them live across the barriers for every lane measured 3% slower.
 fn resolve_words(w0: u32, w1: u32, pm: vec2<u32>, lo: u32, hi: u32, backdrop: i32, even_odd: bool) -> u32 {
     let r = 0x11111111u;
     let plus_lo = spread8(pm.x & 0xffu);

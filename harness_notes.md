@@ -307,6 +307,25 @@ the sparse gathers were not buying anything: the 8 KB LUT is cache-resident and 
 costs more than the extra loads. The 3x over direct evaluation comes from one FMA plus a
 lookup replacing 16 FMA-and-compares per cell, not from skipping cells.
 
+Payload-stage ablation (always-gather mode, 8x8, `MABL` env bits: 1 = no LUT gather,
+2 = no classification arithmetic; `MPROF=4` = no lane spreads), median ms:
+
+| removed              | full  | compute only (MPROF=2) |
+|----------------------|-------|------------------------|
+| nothing              | 1.018 | 0.578                  |
+| LUT gather           | 0.968 | 0.517                  |
+| classification       | 1.010 | 0.555                  |
+| gather + classify    | 0.947 | 0.504                  |
+| lane spreads         | 1.012 |                        |
+
+Gather ~5%, classification 1-2%, spreads <1%. The remaining ~0.5 ms of payload is a broad
+per-cell floor of small arithmetic (LUT index, row masks, selects), close to the dense
+area version's compute-only floor (0.43). The MSAA-vs-area gap is in merge + resolve
+(0.44 vs 0.05 ms): two atomics per cell instead of one, and the SWAR resolve on heads
+(0.25). Passing the head's four payload spreads into the resolve instead of recomputing
+them made one-line 3% slower (four more live registers across the barriers) and two-line
+9% faster; reverted, two-line still behind.
+
 Observations:
 - MSAA costs 2.0x the dense area version at 8x8 and 2.3x at 4x4; the first version was 7x.
 - The LUT beats direct 16-sample evaluation by 2.9-3.4x.
