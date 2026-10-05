@@ -26,17 +26,6 @@ fn byte(v: u32, q: u32) -> u32 {
     return (v >> (8u * q)) & 0xffu;
 }
 
-fn x_at(p0: vec2<f32>, p1: vec2<f32>, y: f32) -> f32 {
-    if y == p0.y {
-        return p0.x;
-    }
-    if y == p1.y {
-        return p1.x;
-    }
-    let d = p1 - p0;
-    return p0.x + (y - p0.y) * (d.x / d.y);
-}
-
 // Partial record index of (quadrant q, piece k) within a run segment whose counts are in
 // sh_qcount at run head h.
 fn record_index(h: u32, q: u32, k: u32) -> u32 {
@@ -49,140 +38,22 @@ fn record_index(h: u32, q: u32, k: u32) -> u32 {
 }
 
 struct Item {
-    valid: bool,
-    is_head: bool,
-    q: u32,
-    slot: u32,          // item position of the piece head
-    s: Setup,
-    out: u32,           // run's out field (with OUT_PARTIAL) for heads
-    rec: u32,           // partial record index for heads
-    bd: i32,            // backdrop + quadrant delta (piece 0 only), for heads
-    even_odd: bool,
+    flags: u32,     // bit 0 valid, bit 1 head, bit 2 even_odd, bits 4-5 quadrant
+    slot: u32,      // item position of the piece head
+    out: u32,       // run's out field (with OUT_PARTIAL) for heads
+    rec: u32,       // partial record index for heads
+    bd: i32,        // backdrop + quadrant delta (piece 0 only), for heads
+    s: QSetup,
 }
 
-// Setup of (entry, quadrant): like msaa_common::setup but clipped to the quadrant's box,
-// with the quadrant's left-edge rule.
-fn setup_quad(ent: Entry, q: u32) -> Setup {
-    let l = lines[ent.line & ~LINE_LEFT_EDGE];
-    let origin = vec2(f32((ent.key & 0x3ffu) * TILE), f32(((ent.key >> 10u) & 0x3ffu) * TILE));
-    let p0 = l.xy - origin;
-    let p1 = l.zw - origin;
-    let d = p1 - p0;
-    let qx = q & 1u;
-    let qy = q >> 1u;
-    let x_lo = f32(4u * qx);
-    let y_lo = f32(4u * qy);
-    // Clip x to the quadrant's range.
-    var q0 = p0;
-    var q1 = p1;
-    if d.x != 0.0 {
-        let ta = (x_lo - p0.x) / d.x;
-        let tb = (x_lo + 4.0 - p0.x) / d.x;
-        let t_lo = max(min(ta, tb), 0.0);
-        let t_hi = max(min(max(ta, tb), 1.0), t_lo);
-        q0 = p0 + t_lo * d;
-        q1 = p0 + t_hi * d;
-    }
-    var s: Setup;
-    s.a = d.y;
-    s.b = -d.x;
-    s.d = s.a * q0.x + s.b * q0.y;
-    s.h = (abs(s.a) + abs(s.b)) * (0.5 - 1.0 / 65536.0);
-    s.q0y = q0.y;
-    s.q1y = q1.y;
-    s.dxdy = select(0.0, d.x / d.y, d.y != 0.0);
-    s.x_at_y0 = p0.x - p0.y * s.dxdy;
-    s.sign_pos = s.a < 0.0;
-    s.ye = 0.0;
-    s.ye_pos = false;
-    s.has_ye = false;
-    if qx == 1u {
-        // Left edge is the tile's vertical midline. Flag if the segment (clipped to the
-        // tile's x-range, then to this quadrant row) has points left of it.
-        var c0 = p0;
-        var c1 = p1;
-        if d.x != 0.0 {
-            let ta = (0.0 - p0.x) / d.x;
-            let tb = (8.0 - p0.x) / d.x;
-            let t_lo = max(min(ta, tb), 0.0);
-            let t_hi = max(min(max(ta, tb), 1.0), t_lo);
-            c0 = p0 + t_lo * d;
-            c1 = p0 + t_hi * d;
-        }
-        let ymin = min(c0.y, c1.y);
-        let ymax = max(c0.y, c1.y);
-        let ya = max(ymin, y_lo);
-        let yb = min(ymax, y_lo + 4.0);
-        var xa = min(c0.x, c1.x);
-        if d.y != 0.0 {
-            xa = min(x_at(p0, p1, ya), x_at(p0, p1, yb));
-        }
-        if xa < 4.0 && d.x != 0.0 {
-            s.ye = p0.y + (4.0 - p0.x) * (d.y / d.x);
-            s.ye_pos = d.x > 0.0;
-            s.has_ye = true;
-        }
-    } else if (ent.line & LINE_LEFT_EDGE) != 0u && d.x != 0.0 {
-        // Same expression as msaa_common::setup (d / b from the tile-x-clipped start), so
-        // the y_edge sample boundary rounds identically to the 8x8 reference.
-        let ta = (0.0 - p0.x) / d.x;
-        let tb = (8.0 - p0.x) / d.x;
-        let t_lo = max(min(ta, tb), 0.0);
-        let qt = p0 + t_lo * d;
-        let dt = s.a * qt.x + s.b * qt.y;
-        let ye_tile = dt / s.b;
-        if (qy == 0u && ye_tile < 4.0) || (qy == 1u && ye_tile > 4.0) {
-            s.ye = ye_tile;
-            s.ye_pos = d.x > 0.0;
-            s.has_ye = true;
-        }
-    }
-    // LUT walk for the segment clipped to the quadrant box (y as well).
-    var c0 = q0;
-    var c1 = q1;
-    let dy = q1.y - q0.y;
-    if dy != 0.0 {
-        let ta = (y_lo - q0.y) / dy;
-        let tb = (y_lo + 4.0 - q0.y) / dy;
-        let t_lo = max(min(ta, tb), 0.0);
-        let t_hi = max(min(max(ta, tb), 1.0), t_lo);
-        let dq = q1 - q0;
-        c0 = q0 + t_lo * dq;
-        c1 = q0 + t_hi * dq;
-    }
-    let is_down = c1.y >= c0.y;
-    let xy0 = select(c1, c0, is_down);
-    let xy1 = select(c0, c1, is_down);
-    let ldx = abs(xy1.x - xy0.x);
-    let ldy = xy1.y - xy0.y;
-    let idxdy = 1.0 / (ldx + ldy);
-    var la = ldx * idxdy;
-    let is_pos = xy1.x >= xy0.x;
-    let x_sign = select(-1.0, 1.0, is_pos);
-    let xt0 = floor(xy0.x * x_sign);
-    let c = xy0.x * x_sign - xt0;
-    let y0i = floor(xy0.y);
-    let ytop = y0i + 1.0;
-    let lb = min((ldy * c + ldx * (ytop - xy0.y)) * idxdy, ONE_MINUS_ULP);
-    let count_x = span(xy0.x, xy1.x) - 1u;
-    let count = count_x + span(xy0.y, xy1.y);
-    let robust_err = floor(la * (f32(count) - 1.0) + lb) - f32(count_x);
-    if robust_err != 0.0 {
-        la -= ROBUST_EPSILON * sign(robust_err);
-    }
-    s.la = la;
-    s.lb = lb;
-    s.x_sign = x_sign;
-    s.x0i = i32(xt0 * x_sign + 0.5 * (x_sign - 1.0));
-    s.y0i = i32(y0i);
-    s.is_pos = is_pos;
-    return s;
-}
+fn item_valid(it: Item) -> bool { return (it.flags & 1u) != 0u; }
+fn item_head(it: Item) -> bool { return (it.flags & 2u) != 0u; }
+fn item_eo(it: Item) -> bool { return (it.flags & 4u) != 0u; }
+fn item_q(it: Item) -> u32 { return (it.flags >> 4u) & 3u; }
 
 fn make_item(p: u32) -> Item {
     var it: Item;
-    it.valid = false;
-    it.is_head = false;
+    it.flags = 0u;
     let totals = sh_totals;
     let b1 = totals.x;
     let b2 = b1 + totals.y;
@@ -209,19 +80,19 @@ fn make_item(p: u32) -> Item {
     let h = sh_head[e];
     let group_head = block + byte(sh_scan[h], q);
     let rank = p - group_head;
-    it.valid = true;
-    it.q = q;
+    let is_head = (rank & 7u) == 0u;
     it.slot = group_head + (rank & ~7u);
-    it.is_head = (rank & 7u) == 0u;
     let ent = entries[sh_base + e];
     it.s = setup_quad(ent, q);
-    if it.is_head {
+    var eo = false;
+    if is_head {
         let he = entries[sh_base + h];
         it.out = he.out;
         it.rec = (he.out & ~OUT_PARTIAL) + record_index(h, q, rank >> 3u);
         it.bd = select(0, he.backdrop + atomicLoad(&sh_delta[h * 4u + q]), rank < 8u);
-        it.even_odd = (path_flags[he.key >> 20u] & 1u) != 0u;
+        eo = (path_flags[he.key >> 20u] & 1u) != 0u;
     }
+    it.flags = 1u | (u32(is_head) << 1u) | (u32(eo) << 2u) | (q << 4u);
     return it;
 }
 
@@ -234,7 +105,7 @@ fn emit(it: Item, cell: u32, w0: u32, w1: u32, pm: vec2<u32>, lo: u32, hi: u32, 
         partials_out[base_ix + 2u] = i32(pm.x | (pm.y << 16u));
         partials_out[base_ix + 3u] = it.bd;
     } else {
-        let mask = resolve_words(w0, w1, pm, lo, hi, it.bd, it.even_odd);
+        let mask = resolve_words(w0, w1, pm, lo, hi, it.bd, item_eo(it));
         *pack |= mask << (16u * (cell & 1u));
         if (cell & 1u) == 1u {
             mask_out[it.out * (PIXELS / 2u) + (cell >> 1u)] = *pack;
@@ -429,29 +300,44 @@ fn main(
     var rm2: RowMasks;
     if MPROF == 1u {
         // Ablation: setup only.
-        if it0.valid && it1.valid && it0.slot == 0xfffffffu {
-            mask_out[0] = it0.q + it1.q + it2.q;
+        if item_valid(it0) && item_valid(it1) && it0.slot == 0xfffffffu {
+            mask_out[0] = it0.flags + it1.flags + it2.flags;
         }
         return;
     }
 
+    let q0 = item_q(it0);
+    let q1 = item_q(it1);
+    let q2 = item_q(it2);
+    let v0 = item_valid(it0);
+    let v1 = item_valid(it1);
+    let v2 = item_valid(it2);
     for (var cell = 0u; cell < 16u; cell++) {
         let ly = cell >> 2u;
         let lx = cell & 3u;
-        if lx == 0u {
-            rm0 = row_masks(it0.s, 4u * (it0.q >> 1u) + ly);
-            rm1 = row_masks(it1.s, 4u * (it1.q >> 1u) + ly);
-            rm2 = row_masks(it2.s, 4u * (it2.q >> 1u) + ly);
+        // Payloads only for valid items; valid positions are a prefix of the item range, so
+        // this is uniform across all but one SIMD group per batch.
+        var pm0 = vec2(0u, 0u);
+        var pm1 = vec2(0u, 0u);
+        var pm2 = vec2(0u, 0u);
+        if v0 {
+            if lx == 0u {
+                rm0 = q_row_masks(it0.s, 4u * (q0 >> 1u) + ly);
+            }
+            pm0 = q_payload(it0.s, q_cell_hp(it0.s, 4u * (q0 & 1u) + lx, 4u * (q0 >> 1u) + ly), rm0);
         }
-        let x0 = 4u * (it0.q & 1u) + lx;
-        let x1 = 4u * (it1.q & 1u) + lx;
-        let x2 = 4u * (it2.q & 1u) + lx;
-        let y0 = 4u * (it0.q >> 1u) + ly;
-        let y1 = 4u * (it1.q >> 1u) + ly;
-        let y2 = 4u * (it2.q >> 1u) + ly;
-        let pm0 = cell_payload(it0.s, cell_hp(it0.s, x0, y0), rm0);
-        let pm1 = cell_payload(it1.s, cell_hp(it1.s, x1, y1), rm1);
-        let pm2 = cell_payload(it2.s, cell_hp(it2.s, x2, y2), rm2);
+        if v1 {
+            if lx == 0u {
+                rm1 = q_row_masks(it1.s, 4u * (q1 >> 1u) + ly);
+            }
+            pm1 = q_payload(it1.s, q_cell_hp(it1.s, 4u * (q1 & 1u) + lx, 4u * (q1 >> 1u) + ly), rm1);
+        }
+        if v2 {
+            if lx == 0u {
+                rm2 = q_row_masks(it2.s, 4u * (q2 >> 1u) + ly);
+            }
+            pm2 = q_payload(it2.s, q_cell_hp(it2.s, 4u * (q2 & 1u) + lx, 4u * (q2 >> 1u) + ly), rm2);
+        }
         let lo0 = spread8(pm0.x & 0xffu) - spread8(pm0.y & 0xffu);
         let hi0 = spread8(pm0.x >> 8u) - spread8(pm0.y >> 8u);
         let lo1 = spread8(pm1.x & 0xffu) - spread8(pm1.y & 0xffu);
@@ -459,34 +345,33 @@ fn main(
         let lo2 = spread8(pm2.x & 0xffu) - spread8(pm2.y & 0xffu);
         let hi2 = spread8(pm2.x >> 8u) - spread8(pm2.y >> 8u);
 
-        // Slots were initialized to BIAS; heads re-bias after reading (below).
-        if it0.valid && !it0.is_head {
+        if v0 && !item_head(it0) {
             atomicAdd(&sh_slot[2u * it0.slot], lo0);
             atomicAdd(&sh_slot[2u * it0.slot + 1u], hi0);
         }
-        if it1.valid && !it1.is_head {
+        if v1 && !item_head(it1) {
             atomicAdd(&sh_slot[2u * it1.slot], lo1);
             atomicAdd(&sh_slot[2u * it1.slot + 1u], hi1);
         }
-        if it2.valid && !it2.is_head {
+        if v2 && !item_head(it2) {
             atomicAdd(&sh_slot[2u * it2.slot], lo2);
             atomicAdd(&sh_slot[2u * it2.slot + 1u], hi2);
         }
         workgroupBarrier();
-        if it0.is_head {
+        if item_head(it0) {
             let w0 = atomicExchange(&sh_slot[2u * it0.slot], BIAS);
             let w1 = atomicExchange(&sh_slot[2u * it0.slot + 1u], BIAS);
-            emit(it0, it0.q * 16u + cell, w0, w1, pm0, lo0, hi0, &pack0);
+            emit(it0, q0 * 16u + cell, w0, w1, pm0, lo0, hi0, &pack0);
         }
-        if it1.is_head {
+        if item_head(it1) {
             let w0 = atomicExchange(&sh_slot[2u * it1.slot], BIAS);
             let w1 = atomicExchange(&sh_slot[2u * it1.slot + 1u], BIAS);
-            emit(it1, it1.q * 16u + cell, w0, w1, pm1, lo1, hi1, &pack1);
+            emit(it1, q1 * 16u + cell, w0, w1, pm1, lo1, hi1, &pack1);
         }
-        if it2.is_head {
+        if item_head(it2) {
             let w0 = atomicExchange(&sh_slot[2u * it2.slot], BIAS);
             let w1 = atomicExchange(&sh_slot[2u * it2.slot + 1u], BIAS);
-            emit(it2, it2.q * 16u + cell, w0, w1, pm2, lo2, hi2, &pack2);
+            emit(it2, q2 * 16u + cell, w0, w1, pm2, lo2, hi2, &pack2);
         }
         workgroupBarrier();
     }

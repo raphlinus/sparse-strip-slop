@@ -20,6 +20,8 @@ pub enum Mode {
     Msaa2,
     /// MSAA 16 payload, 8x8 entries merged as load-balanced 4x4 quadrants.
     MsaaQuadrant,
+    /// MSAA 16 payload, one 4x4 quadrant item per thread from a host-expanded item list.
+    MsaaFlat,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -42,16 +44,20 @@ impl Variant {
     /// Entries per piece before a new output slot is needed (the quadrant variant only
     /// splits at workgroup boundaries).
     pub fn piece_size(&self) -> usize {
-        if matches!(self.mode, Mode::Quadrant | Mode::MsaaQuadrant) { usize::MAX } else { crate::tiler::PIECE }
+        if matches!(self.mode, Mode::Quadrant | Mode::MsaaQuadrant | Mode::MsaaFlat) { usize::MAX } else { crate::tiler::PIECE }
     }
 
     /// Pixel (x, y) -> index within a run's output tile.
     pub fn layout_index(&self, x: u32, y: u32) -> usize {
-        if matches!(self.mode, Mode::Quadrant | Mode::MsaaQuadrant) {
+        if matches!(self.mode, Mode::Quadrant | Mode::MsaaQuadrant | Mode::MsaaFlat) {
             crate::reference::quadrant_major_index(x, y)
         } else {
             crate::reference::coset_major_index(x, y)
         }
+    }
+
+    pub fn is_msaa(&self) -> bool {
+        matches!(self.mode, Mode::Msaa | Mode::Msaa2 | Mode::MsaaQuadrant | Mode::MsaaFlat)
     }
 
     pub fn entries_per_wg(&self) -> usize {
@@ -72,12 +78,13 @@ impl Variant {
             Mode::Msaa => "msaa",
             Mode::Msaa2 => "msaa2",
             Mode::MsaaQuadrant => "msaaquad",
+            Mode::MsaaFlat => "msaaflat",
         };
         let dense = if self.dense { "_dense" } else { "" };
         if self.mode == Mode::Quadrant {
             return format!("{mode}_wg{}_e{}", self.wg_size, self.entries_per_wg());
         }
-        if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 || self.mode == Mode::MsaaQuadrant {
+        if self.is_msaa() {
             let cm = ["inlinelut", "fifolut", "direct", "alwayslut"][self.cell_mode as usize];
             return format!("{mode}_{cm}_wg{}", self.wg_size);
         }
@@ -96,13 +103,15 @@ impl Variant {
             "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CHUNK: u32 = {}u;\nconst PROFILE: u32 = {}u;\nconst DENSE: u32 = {}u;\n",
             TILE, self.wg_size, self.chunk, self.profile, self.dense as u32
         );
-        if self.mode == Mode::Msaa || self.mode == Mode::Msaa2 || self.mode == Mode::MsaaQuadrant {
+        if self.is_msaa() {
             let mprof: u32 = std::env::var("MPROF").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let mabl: u32 = std::env::var("MABL").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let qsetup = include_str!("../shader/msaa_quadrant_setup.wgsl");
             let body = match self.mode {
-                Mode::Msaa => include_str!("../shader/msaa1.wgsl"),
-                Mode::Msaa2 => include_str!("../shader/msaa2.wgsl"),
-                _ => include_str!("../shader/msaa_quadrant.wgsl"),
+                Mode::Msaa => include_str!("../shader/msaa1.wgsl").to_string(),
+                Mode::Msaa2 => include_str!("../shader/msaa2.wgsl").to_string(),
+                Mode::MsaaQuadrant => format!("{qsetup}\n{}", include_str!("../shader/msaa_quadrant.wgsl")),
+                _ => format!("{qsetup}\n{}", include_str!("../shader/msaa_flat.wgsl")),
             };
             return format!(
                 "const TILE: u32 = {}u;\nconst WG_SIZE: u32 = {}u;\nconst CELL_MODE: u32 = {}u;\nconst MPROF: u32 = {}u;\nconst MABL: u32 = {}u;\n{}\n{body}",
@@ -133,7 +142,7 @@ impl Variant {
             Mode::ComputeOnly => include_str!("../shader/merge0.wgsl"),
             Mode::OneLine => include_str!("../shader/merge1.wgsl"),
             Mode::TwoLines => include_str!("../shader/merge2.wgsl"),
-            Mode::Simple | Mode::Quadrant | Mode::Msaa | Mode::Msaa2 | Mode::MsaaQuadrant => unreachable!(),
+            Mode::Simple | Mode::Quadrant | Mode::Msaa | Mode::Msaa2 | Mode::MsaaQuadrant | Mode::MsaaFlat => unreachable!(),
         };
         format!("{header}{}\n{body}", include_str!("../shader/phase2.wgsl"))
     }
@@ -190,10 +199,17 @@ impl Gpu {
         n_partials: u32,
         iterations: u32,
         lut: Option<&[u32]>,
+        items: Option<&[[u32; 4]]>,
     ) -> GpuResult {
         let device = &self.device;
         assert_eq!(entries.len() % variant.entries_per_wg(), 0);
-        let n_wg = (entries.len() / variant.entries_per_wg()) as u32;
+        let n_wg = match items {
+            Some(it) => {
+                assert_eq!(it.len() % variant.wg_size as usize, 0);
+                (it.len() / variant.wg_size as usize) as u32
+            }
+            None => (entries.len() / variant.entries_per_wg()) as u32,
+        };
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&variant.name()),
@@ -226,7 +242,7 @@ impl Gpu {
         });
         // Area: 1 byte per pixel, 4 bytes per partial sample. MSAA: 2 bytes per pixel
         // (16-bit mask), 16 x 4 bytes per partial pixel.
-        let (alpha_size, partials_size) = if matches!(variant.mode, Mode::Msaa | Mode::Msaa2 | Mode::MsaaQuadrant) {
+        let (alpha_size, partials_size) = if variant.is_msaa() {
             ((n_alpha.max(1) as u64) * PIXELS as u64 * 2, (n_partials.max(1) as u64) * PIXELS as u64 * 16)
         } else {
             ((n_alpha.max(1) as u64) * PIXELS as u64, (n_partials.max(1) as u64) * PIXELS as u64 * 4)
@@ -283,6 +299,19 @@ impl Gpu {
             bind_entries.push(wgpu::BindGroupEntry {
                 binding: 5,
                 resource: lb.as_entire_binding(),
+            });
+        }
+        let items_buf = items.map(|it| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("items"),
+                contents: bytemuck::cast_slice(it),
+                usage: storage,
+            })
+        });
+        if let Some(ib) = &items_buf {
+            bind_entries.push(wgpu::BindGroupEntry {
+                binding: 6,
+                resource: ib.as_entire_binding(),
             });
         }
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

@@ -293,6 +293,7 @@ fn main() {
             tiled.n_partials,
             iterations,
             None,
+            None,
         );
         if !result.times_ms.is_empty() {
             // Skip warm-up iterations; the first timestamp pair is also unreliable on Metal.
@@ -523,6 +524,137 @@ fn fold_quadrant_partials(
     w
 }
 
+/// Flat item list for the MSAA flat variant: (entry, quadrant, run first entry, 0),
+/// quadrant-major within each run, padded to whole workgroups with sentinel items.
+fn build_flat_items(scene: &Scene, tiled: &Tiled, wg: usize) -> Vec<[u32; 4]> {
+    let mut items = Vec::new();
+    for r in &tiled.runs {
+        let (start, end) = (r.entry_start as usize, r.entry_end as usize);
+        let masks: Vec<u32> = tiled.entries[start..end]
+            .iter()
+            .map(|e| {
+                let line = &scene.lines[(e.line & !LINE_LEFT_EDGE) as usize];
+                quadrants_touched(line, e.key & 0x3ff, (e.key >> 10) & 0x3ff)
+            })
+            .collect();
+        let before = items.len();
+        for q in 0..4u32 {
+            for (k, m) in masks.iter().enumerate() {
+                if (m >> q) & 1 != 0 {
+                    items.push([(start + k) as u32, q, start as u32, 0]);
+                }
+            }
+        }
+        if items.len() == before {
+            // A run whose lines touch no quadrant (corner grazes) still needs a thread to
+            // write its backdrop-only output: one item on quadrant 0 with a zero payload.
+            items.push([start as u32, 0, start as u32, 0]);
+        }
+    }
+    let real_end = tiled.runs.last().map_or(0, |r| r.entry_end);
+    let padded = items.len().div_ceil(wg) * wg;
+    items.resize(padded, [real_end, 0, real_end, 0]);
+    items
+}
+
+/// Item counts per quadrant of a run within item positions [a, b).
+fn flat_segment_qcounts(items: &[[u32; 4]], a: usize, b: usize) -> [u32; 4] {
+    let mut cnt = [0u32; 4];
+    for it in &items[a..b] {
+        cnt[it[1] as usize] += 1;
+    }
+    cnt
+}
+
+/// Output allocation for the flat variant: segments are workgroup ranges in item space.
+/// Returns the item range of each run.
+fn allocate_flat_msaa(items: &mut [[u32; 4]], tiled: &mut Tiled, wg: usize) -> Vec<(usize, usize)> {
+    let mut n_alpha = 0u32;
+    let mut n_partials = 0u32;
+    let mut ranges = Vec::with_capacity(tiled.runs.len());
+    let mut pos = 0usize;
+    let n_runs = tiled.runs.len();
+    for ri in 0..n_runs {
+        let start_e = tiled.runs[ri].entry_start as usize;
+        let end_e = tiled.runs[ri].entry_end as usize;
+        let a = pos;
+        while pos < items.len() && (items[pos][0] as usize) < end_e && (items[pos][0] as usize) >= start_e {
+            pos += 1;
+        }
+        let b = pos;
+        ranges.push((a, b));
+        for e in &mut tiled.entries[start_e..end_e] {
+            e.out = 0;
+        }
+        let one_segment = b == a || (a / wg == (b - 1) / wg);
+        let cnt = flat_segment_qcounts(items, a, b);
+        if one_segment && cnt.iter().all(|&c| c <= 8) {
+            tiled.entries[start_e].out = n_alpha;
+            tiled.runs[ri].output = RunOutput::Alpha(n_alpha);
+            n_alpha += 1;
+        } else {
+            // Each workgroup segment gets a contiguous block of records; its base is stored
+            // in the 4th field of the segment's first item, which is the run head item of
+            // that workgroup, where the shader reads it.
+            let first = n_partials;
+            let mut s = a;
+            while s < b {
+                let e = ((s / wg) + 1) * wg;
+                let se = e.min(b);
+                let c = flat_segment_qcounts(items, s, se);
+                items[s][3] = n_partials;
+                n_partials += segment_records(&c);
+                s = se;
+            }
+            tiled.entries[start_e].out = tiler::OUT_PARTIAL | first;
+            tiled.runs[ri].output = RunOutput::Partials { first, count: n_partials - first };
+        }
+    }
+    let real_end = tiled.runs.last().map_or(0, |r| r.entry_end as usize);
+    for e in &mut tiled.entries[real_end..] {
+        e.out = n_alpha;
+    }
+    tiled.n_alpha = n_alpha + 1;
+    tiled.n_partials = n_partials;
+    ranges
+}
+
+/// Fold the flat variant's partial records of a run (item range [a, b)).
+fn fold_flat_partials(items: &[[u32; 4]], a: usize, b: usize, first: u32, partials: &[i32], wg: usize) -> Vec<[i32; 16]> {
+    let mut w = vec![[0i32; 16]; PIXELS];
+    let mut rec = first as usize;
+    let mut s = a;
+    while s < b {
+        let e = ((s / wg) + 1) * wg;
+        let se = e.min(b);
+        let cnt = flat_segment_qcounts(items, s, se);
+        for q in 0..4u32 {
+            let pieces = cnt[q as usize].div_ceil(8).max(1) as usize;
+            for _ in 0..pieces {
+                for p in 0..16u32 {
+                    let base = (rec * 16 + p as usize) * 4;
+                    let w0 = partials[base] as u32;
+                    let w1 = partials[base + 1] as u32;
+                    let own = partials[base + 2] as u32;
+                    let bd = partials[base + 3];
+                    let x = 4 * (q & 1) + (p & 3);
+                    let y = 4 * (q >> 1) + (p >> 2);
+                    let pix = (y * TILE + x) as usize;
+                    for sidx in 0..16 {
+                        let word = if sidx < 8 { w0 } else { w1 };
+                        let lane = ((word >> (4 * (sidx & 7))) & 0xf) as i32 - 8;
+                        let o = ((own >> sidx) & 1) as i32 - ((own >> (16 + sidx)) & 1) as i32;
+                        w[pix][sidx] += lane + o + bd;
+                    }
+                }
+                rec += 1;
+            }
+        }
+        s = se;
+    }
+    w
+}
+
 /// MSAA 16 path: CPU reference against the sample-point oracle, then GPU variants.
 fn msaa_main() {
     let args: Vec<String> = std::env::args().collect();
@@ -646,10 +778,9 @@ fn msaa_main() {
     lines_padded.push([0.0; 4]);
     let msaa_variants = [
         (Mode::Msaa, 0u32),
-        (Mode::Msaa, 3),
         (Mode::MsaaQuadrant, 0),
-        (Mode::MsaaQuadrant, 3),
-        (Mode::Msaa2, 0),
+        (Mode::MsaaFlat, 0),
+        (Mode::MsaaFlat, 3),
     ];
     for (mode, cell_mode) in msaa_variants {
         let variant = Variant {
@@ -669,6 +800,16 @@ fn msaa_main() {
             }
             allocate_quadrant_msaa(&scene, &mut tiled, variant.entries_per_wg());
         }
+        let mut flat_items: Option<Vec<[u32; 4]>> = None;
+        let mut flat_ranges: Vec<(usize, usize)> = Vec::new();
+        if mode == Mode::MsaaFlat {
+            if TILE != 8 {
+                continue;
+            }
+            let mut items = build_flat_items(&scene, &tiled, variant.wg_size as usize);
+            flat_ranges = allocate_flat_msaa(&mut items, &mut tiled, variant.wg_size as usize);
+            flat_items = Some(items);
+        }
         let ref_masks: Vec<[u16; PIXELS]> = tiled
             .runs
             .iter()
@@ -679,7 +820,24 @@ fn msaa_main() {
             })
             .collect();
         if replicate > 1 {
+            let base_entries = tiled.entries.len();
             tiler::replicate(&mut tiled, replicate, scene.paths.len() as u32);
+            if let Some(items) = &mut flat_items {
+                // Replicate items alongside entries: entry indices shift by whole copies,
+                // record bases by whole partial blocks.
+                let base_items: Vec<[u32; 4]> = items.clone();
+                let n_part = tiled.n_partials / replicate as u32;
+                for c in 1..replicate as u32 {
+                    for it in &base_items {
+                        items.push([
+                            it[0] + c * base_entries as u32,
+                            it[1],
+                            it[2] + c * base_entries as u32,
+                            if it[3] != 0 { it[3] + c * n_part } else { 0 },
+                        ]);
+                    }
+                }
+            }
         }
         println!("== {} ==", variant.name());
         let result = gpu.run(
@@ -691,6 +849,7 @@ fn msaa_main() {
             tiled.n_partials,
             iterations,
             Some(&lut_packed),
+            flat_items.as_deref(),
         );
         if !result.times_ms.is_empty() {
             let skip = 1;
@@ -722,6 +881,13 @@ fn msaa_main() {
                             let ci = variant.layout_index(x, y);
                             m[(y * TILE + x) as usize] = (words[ci / 2] >> (16 * (ci % 2))) as u16;
                         }
+                    }
+                }
+                RunOutput::Partials { first, .. } if mode == Mode::MsaaFlat => {
+                    let (a, b) = flat_ranges[ri];
+                    let w = fold_flat_partials(flat_items.as_ref().unwrap(), a, b, first, &result.partials, variant.wg_size as usize);
+                    for i in 0..PIXELS {
+                        m[i] = msaa::resolve_mask(&w[i], eo);
                     }
                 }
                 RunOutput::Partials { first, .. } if mode == Mode::MsaaQuadrant => {

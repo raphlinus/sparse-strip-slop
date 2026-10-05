@@ -365,6 +365,46 @@ Setup struct is ~17 fields and is built three times per thread), and the cell lo
 and payload registers per thread. Both halves are register-pressure costs, not barrier or
 atomic costs.
 
+## MSAA quadrant follow-ups: trimmed item state, flat item list
+
+Trimming the per-item state (compact `QSetup`, packed flags: `shader/msaa_quadrant_setup.wgsl`)
+changed nothing (0.987 ms); predicating the per-slot payload compute on item validity gained
+3% (0.960), consistent with the compiler if-converting it. The three-slot structure is
+the cost, not the struct size.
+
+`shader/msaa_flat.wgsl` (`Mode::MsaaFlat`): the host expands 8x8 entries into a flat item
+list (entry, quadrant, run first entry, record base), ordered quadrant-major within each
+run so groups and pieces of 8 are contiguous, padded per workgroup; runs with no touched
+quadrant get one zero-payload item so their backdrop-only output is written. The shader
+processes one item per thread: run and group head scans (shared loop), touch mask and
+deltas contributed once per entry (the item on the entry's lowest quadrant), per-(run,
+quadrant) counts for the record layout, backdrop applied only by the segment that starts
+the run, then the one-line cell loop with slot = piece head position. The expansion is a
+stand-in for a GPU map-and-scan pass and is not timed.
+
+Same scene, 16x replicated, median ms:
+
+| variant                          | total | setup | cell loop |
+|----------------------------------|-------|-------|-----------|
+| MSAA one line 8x8 (inline LUT)   | 1.040 |       |           |
+| MSAA quadrant 3 slots (inline)   | 0.956 | 0.34  | 0.62      |
+| MSAA flat, inline LUT            | 0.835 |       |           |
+| MSAA flat, always-gather LUT     | 0.814 | 0.39  | 0.43      |
+| MSAA one line 4x4 tiler items    | 0.52  | ~0.1  | ~0.43     |
+
+The flat cell loop matches the 4x4 one-line loop exactly, so one item per thread was the
+right fix for the loop. What remains is setup: 0.39 vs ~0.1, of which the per-item delta
+geometry is only 0.035; the rest is the second scan, the per-(run, quadrant) count and
+touched atomics, record-index bookkeeping, the heavier quadrant setup (two clips plus the
+tile clip for the left-edge rule) and the three-level item -> entry -> line fetch.
+Accuracy: 35 runs / 47 single samples differ from the 8x8 reference, the same sample-row
+ties as the 3-slot quadrant variant.
+
+Net: 8x8 entries into the sort with 4x4-granularity MSAA merging costs 0.81 ms against
+1.04 for merging 8x8 directly and 0.52 for a true 4x4 tiling, i.e. it recovers about
+45% of the gap. Further gains are in the setup bookkeeping, or in having the expansion
+pass precompute per-entry deltas and the quadrant setup so the merge only scans and walks.
+
 ## Ideas not yet tried
 
 - Phase 2 is the target: `cell_area` per hit, 16 classification FMAs per coset, and
